@@ -1204,7 +1204,7 @@ pub mod mouse_hook {
 
         let himl_raw = DRAG_GHOST_HIML.swap(0, Ordering::Relaxed);
         if himl_raw != 0 {
-            let himl = HIMAGELIST(himl_raw as *mut _);
+            let himl = HIMAGELIST(himl_raw);
             let _ = ImageList_Destroy(himl);
         }
     }
