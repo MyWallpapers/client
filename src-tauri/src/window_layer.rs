@@ -1293,12 +1293,9 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Interface mode: forward everything to WebView, no hit_test ──
+                // ── Interface mode: passthrough only, no forward, no style change ──
+                // TEST: does the UI stay visible without any hook intervention?
                 if crate::window_layer::INTERFACE_MODE.load(Ordering::Relaxed) {
-                    set_icon_passthrough(false);
-                    let mut cp = info_hook.pt;
-                    let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
-                    forward(msg, &info_hook, cp.x, cp.y);
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
