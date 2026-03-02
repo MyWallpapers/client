@@ -184,7 +184,7 @@ fn detect_desktop() -> Result<DesktopDetection, crate::error::AppError> {
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         let mut target_parent;
-        let mut shell_for_slv;
+        let shell_for_slv;
 
         // 1. Detection Win11 24H2+: SHELLDLL_DefView is direct child of Progman
         let shell_view = FindWindowExW(
@@ -708,9 +708,6 @@ pub mod mouse_hook {
     }
     pub fn get_dispatch_hwnd() -> isize {
         DISPATCH_HWND.load(Ordering::SeqCst)
-    }
-    pub fn get_webview_hwnd_raw() -> isize {
-        WEBVIEW_HWND.load(Ordering::SeqCst)
     }
     pub fn get_chrome_rwhh_raw() -> isize {
         CHROME_RWHH.load(Ordering::SeqCst)
