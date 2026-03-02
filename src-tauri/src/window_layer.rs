@@ -61,9 +61,8 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
             if entering_interface { "INTERFACE" } else { "WALLPAPER" }
         );
 
-        // En mode interface, strip WS_EX_TRANSPARENT immédiatement
-        // pour que le webview reçoive tous les clics.
         if entering_interface {
+            // Mode interface: strip WS_EX_TRANSPARENT pour que le webview reçoive les events
             unsafe {
                 for raw in [
                     mouse_hook::get_webview_hwnd_raw(),
@@ -74,6 +73,25 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
                         let new_ex = ex & !(WS_EX_TRANSPARENT.0 as isize);
                         if new_ex != ex {
                             SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
+                            info!("[window_layer] Stripped WS_EX_TRANSPARENT from HWND {:#x}", raw);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Mode wallpaper: RESTAURER WS_EX_TRANSPARENT pour que les events hardware
+            // passent à travers Chrome_RWHH vers SysListView32 (nécessaire pour drag icons)
+            unsafe {
+                for raw in [
+                    mouse_hook::get_webview_hwnd_raw(),
+                    mouse_hook::get_chrome_rwhh_raw(),
+                ] {
+                    if raw != 0 {
+                        let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
+                        let new_ex = ex | (WS_EX_TRANSPARENT.0 as isize);
+                        if new_ex != ex {
+                            SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
+                            info!("[window_layer] Restored WS_EX_TRANSPARENT on HWND {:#x}", raw);
                         }
                     }
                 }
@@ -487,6 +505,9 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
     if !detection.syslistview.is_invalid() {
         mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
     }
+    if !detection.zorder_anchor.is_invalid() {
+        mouse_hook::set_zorder_anchor(detection.zorder_anchor.0 as isize);
+    }
 
     apply_injection(our_hwnd, &detection);
     mouse_hook::init_dispatch_window();
@@ -608,6 +629,9 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
                             if !d.syslistview.is_invalid() {
                                 mouse_hook::set_syslistview_hwnd(d.syslistview.0 as isize);
                             }
+                            if !d.zorder_anchor.is_invalid() {
+                                mouse_hook::set_zorder_anchor(d.zorder_anchor.0 as isize);
+                            }
                             apply_injection(HWND(watchdog_our as *mut _), &d);
                             WATCHDOG_PARENT.store(d.target_parent.0 as isize, Ordering::SeqCst);
                             info!("[watchdog] Re-injection done");
@@ -665,6 +689,8 @@ pub mod mouse_hook {
     static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static ZORDER_ANCHOR: AtomicIsize = AtomicIsize::new(0);
+    static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -701,6 +727,15 @@ pub mod mouse_hook {
     }
     pub fn get_chrome_rwhh_raw() -> isize {
         CHROME_RWHH.load(Ordering::SeqCst)
+    }
+    pub fn set_zorder_anchor(h: isize) {
+        ZORDER_ANCHOR.store(h, Ordering::SeqCst);
+    }
+    pub fn get_zorder_anchor() -> isize {
+        ZORDER_ANCHOR.load(Ordering::SeqCst)
+    }
+    pub fn get_target_parent_hwnd() -> isize {
+        TARGET_PARENT_HWND.load(Ordering::SeqCst)
     }
 
     #[inline]
@@ -1233,86 +1268,69 @@ pub mod mouse_hook {
                 let hwnd_under = WindowFromPoint(info_hook.pt);
                 let msg = wparam.0 as u32;
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
-
-                // ── Helper: set/restore WS_EX_TRANSPARENT on the webview windows ──
-                // When transparent, mouse events pass through to SysListView32 below.
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
-                };
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
-                let set_icon_passthrough = |on: bool| {
-                    for raw in [
-                        WEBVIEW_HWND.load(Ordering::Relaxed),
-                        CHROME_RWHH.load(Ordering::Relaxed),
-                    ] {
-                        if raw != 0 {
-                            let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
-                            let new_ex = if on {
-                                ex | WS_EX_TRANSPARENT.0 as isize
-                            } else {
-                                ex & !(WS_EX_TRANSPARENT.0 as isize)
-                            };
-                            if new_ex != ex {
-                                SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
-                            }
-                        }
+
+                // ── Active native drag (icon): laisser passer les hardware messages ──
+                // Chrome_RWHH a WS_EX_TRANSPARENT en mode wallpaper → les events hardware
+                // passent à travers et atteignent SysListView32 nativement via CallNextHookEx.
+                // PAS de PostMessage (ne marche pas pour le drag: LISTVIEW_TrackMouse
+                // utilise SetCapture + PeekMessage modal loop qui nécessite des vrais
+                // hardware messages).
+                if NATIVE_DRAG.load(Ordering::Relaxed) {
+                    if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
+                        NATIVE_DRAG.store(false, Ordering::Relaxed);
                     }
-                };
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
 
                 // ── Not over desktop: pass through ──
                 if !is_over_desktop(hwnd_under) {
-                    // DEBUG: log every unknown class (throttle 500ms, deduplicate)
-                    if msg == WM_MOUSEMOVE {
-                        use std::sync::atomic::{AtomicI64, AtomicIsize};
-                        static LAST_LOG_T: AtomicI64 = AtomicI64::new(0);
-                        static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
-                        let now = info_hook.time as i64;
-                        let prev_t = LAST_LOG_T.load(Ordering::Relaxed);
-                        let prev_h = LAST_HWND.load(Ordering::Relaxed);
-                        let h_raw = hwnd_under.0 as isize;
-                        if h_raw != prev_h || now.wrapping_sub(prev_t) > 500 {
-                            LAST_LOG_T.store(now, Ordering::Relaxed);
-                            LAST_HWND.store(h_raw, Ordering::Relaxed);
-                            let mut cls_buf = [0u16; 128];
-                            let cls_len = GetClassNameW(hwnd_under, &mut cls_buf) as usize;
-                            let cls = String::from_utf16_lossy(&cls_buf[..cls_len]);
-                            let mut pid: u32 = 0;
-                            GetWindowThreadProcessId(hwnd_under, Some(&mut pid));
-                            let parent = GetParent(hwnd_under).unwrap_or_default();
-                            let mut pcls_buf = [0u16; 128];
-                            let pcls_len = GetClassNameW(parent, &mut pcls_buf) as usize;
-                            let pcls = String::from_utf16_lossy(&pcls_buf[..pcls_len]);
-                            log::warn!(
-                                "[hook] MISS hwnd=0x{:X} class='{}' pid={} parent=0x{:X}[{}] pt=({},{})",
-                                h_raw, cls, pid, parent.0 as isize, pcls,
-                                info_hook.pt.x, info_hook.pt.y
-                            );
+                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                }
+
+                // ── Interface mode: PostMessage direct à Chrome_RWHH ──
+                if crate::window_layer::INTERFACE_MODE.load(Ordering::Relaxed) {
+                    let rwhh = CHROME_RWHH.load(Ordering::Relaxed);
+                    if rwhh != 0 {
+                        let rwhh_hwnd = HWND(rwhh as *mut _);
+                        match msg {
+                            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                                let lp = ((info_hook.pt.x as i16 as u16 as u32)
+                                    | ((info_hook.pt.y as i16 as u16 as u32) << 16))
+                                    as isize;
+                                let delta = (info_hook.mouseData >> 16) as i16 as u16;
+                                let wp = (delta as usize) << 16;
+                                let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(wp), LPARAM(lp));
+                            }
+                            _ => {
+                                let mut cp = info_hook.pt;
+                                let _ = ScreenToClient(rwhh_hwnd, &mut cp);
+                                let lp = ((cp.x as i16 as u16 as u32)
+                                    | ((cp.y as i16 as u16 as u32) << 16))
+                                    as isize;
+                                let wp = match msg {
+                                    WM_LBUTTONDOWN => MK_LBUTTON as usize,
+                                    WM_RBUTTONDOWN => MK_RBUTTON as usize,
+                                    WM_MBUTTONDOWN => MK_MBUTTON as usize,
+                                    _ => 0,
+                                };
+                                let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(wp), LPARAM(lp));
+                            }
                         }
                     }
-                    set_icon_passthrough(false);
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Interface mode: passthrough only, no forward, no style change ──
-                // TEST: does the UI stay visible without any hook intervention?
-                if crate::window_layer::INTERFACE_MODE.load(Ordering::Relaxed) {
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
+                // ── Wallpaper mode (v0.243 approach): ──
+                // Button-down on icon → NATIVE_DRAG, CallNextHookEx delivers
+                // hardware message natively à SysListView32 (Chrome_RWHH est transparent).
+                // Pas de PostMessage: le drag natif nécessite des vrais hardware messages.
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
+                    if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
+                        NATIVE_DRAG.store(true, Ordering::Relaxed);
+                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                    }
                 }
-
-                // ── Wallpaper mode: check if cursor is over a desktop icon ──
-                let over_icon =
-                    slv_raw != 0 && hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt);
-
-                if over_icon {
-                    // Make webview transparent → real OS events flow to SysListView32.
-                    // This enables: proper hover highlight, selection, DragDetect(),
-                    // DoDragDrop(), rename, double-click — all natively.
-                    set_icon_passthrough(true);
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
-                }
-
-                // ── Not over an icon: restore opacity, handle as wallpaper ──
-                set_icon_passthrough(false);
 
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
