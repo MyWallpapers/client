@@ -651,6 +651,7 @@ pub mod mouse_hook {
     const LVM_SETITEMPOSITION: u32 = LVM_FIRST + 15; // 0x100F
     const LVM_GETITEMPOSITION: u32 = LVM_FIRST + 16; // 0x1010
     const LVM_HITTEST: u32 = LVM_FIRST + 18; // 0x1012
+    const LVM_SETHOTITEM: u32 = LVM_FIRST + 60; // 0x103C
 
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -678,6 +679,12 @@ pub mod mouse_hook {
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
     static RCLICK_ON_ICON: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    // Hover tracking — LVM_SETHOTITEM (PostMessage(WM_MOUSEMOVE) doesn't work
+    // because ListView's hot-tracking checks real cursor pos via GetCursorPos)
+    static CURRENT_HOT_ITEM: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    static LAST_HOVER_TICK: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -1440,11 +1447,31 @@ pub mod mouse_hook {
                     }
                 }
 
-                // Forward mousemove to SysListView32 for native hover highlight.
-                // PostMessageW is near-free (one kernel call, no cross-process alloc).
-                // The ListView handles hot-tracking internally.
+                // Hover highlight via LVM_SETHOTITEM (throttled to ~30ms).
+                // PostMessage(WM_MOUSEMOVE) doesn't work because ListView's
+                // hot-tracking calls GetCursorPos and sees cursor over Chrome_RWHH.
+                // Instead: cross-process LVM_HITTEST → LVM_SETHOTITEM.
                 if msg == WM_MOUSEMOVE && slv_raw != 0 {
-                    post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                    let now = windows::Win32::System::SystemInformation::GetTickCount64();
+                    let last = LAST_HOVER_TICK.load(Ordering::Relaxed);
+                    if now.wrapping_sub(last) >= 30 {
+                        LAST_HOVER_TICK.store(now, Ordering::Relaxed);
+                        let slv_h = HWND(slv_raw as *mut _);
+                        let item = get_hit_item_index(slv_h, &info_hook.pt);
+                        let prev = CURRENT_HOT_ITEM.swap(item, Ordering::Relaxed);
+                        if item != prev {
+                            // wParam = item index (-1 clears hot item)
+                            let _ = SendMessageTimeoutW(
+                                slv_h,
+                                LVM_SETHOTITEM,
+                                WPARAM(item as i32 as u32 as usize),
+                                LPARAM(0),
+                                SMTO_ABORTIFHUNG,
+                                50,
+                                None,
+                            );
+                        }
+                    }
                 }
 
                 let mut cp = info_hook.pt;

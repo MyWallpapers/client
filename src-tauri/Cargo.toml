@@ -55,6 +55,7 @@ features = [
     "Win32_System_Memory",
     "Win32_UI_Shell",
     "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
     "Media_Control",
     "Foundation",
     "Storage_Streams",
