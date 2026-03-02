@@ -1235,16 +1235,24 @@ pub mod mouse_hook {
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
 
-                // ── Active native drag (icon): laisser passer les hardware messages ──
-                // Chrome_RWHH a WS_EX_TRANSPARENT en mode wallpaper → les events hardware
-                // passent à travers et atteignent SysListView32 nativement via CallNextHookEx.
-                // PAS de PostMessage (ne marche pas pour le drag: LISTVIEW_TrackMouse
-                // utilise SetCapture + PeekMessage modal loop qui nécessite des vrais
-                // hardware messages).
+                // ── Active native drag (icon): hybride post_to_slv + CallNextHookEx ──
+                // WM_MOUSEMOVE: JUSTE CallNextHookEx (pas de PostMessage !)
+                //   → SetCapture redirige les hardware messages vers SysListView32
+                //   → LISTVIEW_TrackMouse détecte le mouvement pour le drag
+                // Button-down/up: post_to_slv (nécessaire sur Win11, XamlExplorer ne forwarde pas)
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP || msg == WM_RBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
+                        if slv_raw != 0 {
+                            post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                        }
+                    } else if msg != WM_MOUSEMOVE {
+                        // Autres button events (double-click, etc) → post
+                        if slv_raw != 0 {
+                            post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
+                        }
                     }
+                    // WM_MOUSEMOVE: juste CallNextHookEx (hardware messages pour le drag)
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
@@ -1286,13 +1294,15 @@ pub mod mouse_hook {
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Wallpaper mode (v0.243 approach): ──
-                // Button-down on icon → NATIVE_DRAG, CallNextHookEx delivers
-                // hardware message natively à SysListView32 (Chrome_RWHH est transparent).
-                // Pas de PostMessage: le drag natif nécessite des vrais hardware messages.
+                // ── Wallpaper mode: button-down on icon → NATIVE_DRAG ──
+                // post_to_slv pour le clic initial (nécessaire: XamlExplorer ne forwarde pas)
+                // Le drag fonctionnera car: post_to_slv envoie WM_LBUTTONDOWN → SysListView32
+                // entre dans LISTVIEW_TrackMouse → SetCapture → les WM_MOUSEMOVE hardware
+                // (via CallNextHookEx) sont capturés par SysListView32 pour détecter le drag.
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
                     if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
                         NATIVE_DRAG.store(true, Ordering::Relaxed);
+                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                         return CallNextHookEx(hook_h, code, wparam, lparam);
                     }
                 }
