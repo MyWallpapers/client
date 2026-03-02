@@ -9,12 +9,8 @@ pub enum AppError {
     Updater(String),
     #[error("Validation: {0}")]
     Validation(String),
-    #[error("System monitor: {0}")]
-    SystemMonitor(String),
     #[error("OAuth: {0}")]
     OAuth(String),
-    #[error("Window not found: {0}")]
-    WindowNotFound(String),
     #[error("Media: {0}")]
     Media(String),
     #[error(transparent)]

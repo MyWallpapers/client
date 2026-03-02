@@ -99,9 +99,10 @@ pub fn get_media_info() -> AppResult<MediaInfo> {
     })
 }
 
-/// Toggle play/pause on the current media session.
+/// Get the current active media session (manager → session).
 #[cfg(target_os = "windows")]
-pub fn media_play_pause() -> AppResult<()> {
+fn current_session(
+) -> AppResult<windows::Media::Control::GlobalSystemMediaTransportControlsSession> {
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
 
     let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
@@ -109,16 +110,19 @@ pub fn media_play_pause() -> AppResult<()> {
         .get()
         .map_err(|e| AppError::Media(format!("Manager get failed: {}", e)))?;
 
-    let session = manager
+    manager
         .GetCurrentSession()
-        .map_err(|e| AppError::Media(format!("No active session: {}", e)))?;
+        .map_err(|e| AppError::Media(format!("No active session: {}", e)))
+}
 
-    session
+/// Toggle play/pause on the current media session.
+#[cfg(target_os = "windows")]
+pub fn media_play_pause() -> AppResult<()> {
+    current_session()?
         .TryTogglePlayPauseAsync()
         .map_err(|e| AppError::Media(format!("TogglePlayPause failed: {}", e)))?
         .get()
         .map_err(|e| AppError::Media(format!("TogglePlayPause get failed: {}", e)))?;
-
     Ok(())
 }
 
@@ -130,23 +134,11 @@ pub fn media_play_pause() -> AppResult<()> {
 /// Skip to next track.
 #[cfg(target_os = "windows")]
 pub fn media_next() -> AppResult<()> {
-    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-
-    let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .map_err(|e| AppError::Media(format!("RequestAsync failed: {}", e)))?
-        .get()
-        .map_err(|e| AppError::Media(format!("Manager get failed: {}", e)))?;
-
-    let session = manager
-        .GetCurrentSession()
-        .map_err(|e| AppError::Media(format!("No active session: {}", e)))?;
-
-    session
+    current_session()?
         .TrySkipNextAsync()
         .map_err(|e| AppError::Media(format!("SkipNext failed: {}", e)))?
         .get()
         .map_err(|e| AppError::Media(format!("SkipNext get failed: {}", e)))?;
-
     Ok(())
 }
 
@@ -158,23 +150,11 @@ pub fn media_next() -> AppResult<()> {
 /// Skip to previous track.
 #[cfg(target_os = "windows")]
 pub fn media_prev() -> AppResult<()> {
-    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-
-    let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .map_err(|e| AppError::Media(format!("RequestAsync failed: {}", e)))?
-        .get()
-        .map_err(|e| AppError::Media(format!("Manager get failed: {}", e)))?;
-
-    let session = manager
-        .GetCurrentSession()
-        .map_err(|e| AppError::Media(format!("No active session: {}", e)))?;
-
-    session
+    current_session()?
         .TrySkipPreviousAsync()
         .map_err(|e| AppError::Media(format!("SkipPrevious failed: {}", e)))?
         .get()
         .map_err(|e| AppError::Media(format!("SkipPrevious get failed: {}", e)))?;
-
     Ok(())
 }
 

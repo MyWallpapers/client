@@ -106,93 +106,17 @@ static POLL_CATEGORIES: LazyLock<Arc<Mutex<Vec<String>>>> =
 // ============================================================================
 
 /// Collect system data for the requested categories (one-shot).
+/// One-shot collection: creates a temporary System, primes CPU baseline, then delegates.
 pub fn collect_system_data(categories: &[String]) -> SystemData {
-    use sysinfo::System;
+    let mut sys = sysinfo::System::new();
 
-    let mut data = SystemData::default();
-
-    // CPU needs two refreshes with a gap for accurate readings
-    let needs_cpu = categories.iter().any(|c| c == "cpu");
-    let needs_memory = categories.iter().any(|c| c == "memory");
-    let needs_disk = categories.iter().any(|c| c == "disk");
-    let needs_network = categories.iter().any(|c| c == "network");
-    let needs_battery = categories.iter().any(|c| c == "battery");
-    let needs_media = categories.iter().any(|c| c == "media");
-
-    if needs_cpu || needs_memory {
-        let mut sys = System::new();
-
-        if needs_cpu {
-            sys.refresh_cpu_usage();
-            std::thread::sleep(Duration::from_millis(200));
-            sys.refresh_cpu_usage();
-
-            let cpus = sys.cpus();
-            let usage: f32 = if cpus.is_empty() {
-                0.0
-            } else {
-                cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32
-            };
-            let model = cpus
-                .first()
-                .map(|c| c.brand().to_string())
-                .unwrap_or_default();
-
-            data.cpu = Some(CpuInfo {
-                cores: cpus.len() as u32,
-                usage,
-                model,
-            });
-        }
-
-        if needs_memory {
-            sys.refresh_memory();
-            data.memory = Some(MemoryInfo {
-                total: sys.total_memory(),
-                used: sys.used_memory(),
-                free: sys.available_memory(),
-            });
-        }
+    // CPU needs two refreshes with a gap for accurate readings (no prior baseline)
+    if categories.iter().any(|c| c == "cpu") {
+        sys.refresh_cpu_usage();
+        std::thread::sleep(Duration::from_millis(200));
     }
 
-    if needs_disk {
-        let disks = sysinfo::Disks::new_with_refreshed_list();
-        data.disk = Some(
-            disks
-                .iter()
-                .map(|d| DiskInfo {
-                    name: d.name().to_string_lossy().to_string(),
-                    total: d.total_space(),
-                    available: d.available_space(),
-                    fs: d.file_system().to_string_lossy().to_string(),
-                })
-                .collect(),
-        );
-    }
-
-    if needs_network {
-        let networks = sysinfo::Networks::new_with_refreshed_list();
-        data.network = Some(
-            networks
-                .iter()
-                .map(|(name, net)| NetworkInfo {
-                    name: name.clone(),
-                    received: net.total_received(),
-                    transmitted: net.total_transmitted(),
-                })
-                .collect(),
-        );
-    }
-
-    if needs_battery {
-        data.battery = collect_battery_info();
-    }
-
-    if needs_media {
-        data.media = crate::media::get_media_info().ok();
-    }
-
-    data
+    collect_with_system(&mut sys, categories)
 }
 
 /// Collect battery info. Returns None on desktops without a battery.
@@ -354,13 +278,6 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
 
         info!("[system_monitor] Monitor stopped");
     });
-}
-
-/// Stop the background monitor.
-#[allow(dead_code)]
-pub fn stop_monitor() {
-    MONITOR_RUNNING.store(false, Ordering::SeqCst);
-    info!("[system_monitor] Stop requested");
 }
 
 /// Update the categories the monitor polls. Pass empty to pause polling.

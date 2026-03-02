@@ -8,8 +8,6 @@ pub enum AppEvent {
     SystemDataUpdate(Box<crate::system_monitor::SystemData>),
     DeepLink { url: String },
     ReloadApp,
-    SessionStateChanged { active: bool },
-    WebViewReloaded,
 }
 
 impl AppEvent {
@@ -20,8 +18,6 @@ impl AppEvent {
             Self::SystemDataUpdate(_) => "system-data-update",
             Self::DeepLink { .. } => "deep-link",
             Self::ReloadApp => "reload-app",
-            Self::SessionStateChanged { .. } => "session-state-changed",
-            Self::WebViewReloaded => "webview-reloaded",
         }
     }
 }

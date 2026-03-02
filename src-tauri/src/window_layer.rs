@@ -20,11 +20,11 @@ static INTERFACE_MODE: AtomicBool = AtomicBool::new(false);
 // Public API
 // ==============================================================================
 
-pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
+pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "windows")]
     {
         info!("[window_layer] Starting desktop window setup phase...");
-        if let Err(e) = ensure_in_worker_w(_window) {
+        if let Err(e) = ensure_in_worker_w(window) {
             error!(
                 "[window_layer] CRITICAL: Failed to setup desktop layer: {}",
                 e
@@ -36,7 +36,6 @@ pub fn setup_desktop_window(_window: &tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-#[allow(unused_variables)]
 pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
@@ -489,10 +488,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
     if !detection.syslistview.is_invalid() {
         mouse_hook::set_syslistview_hwnd(detection.syslistview.0 as isize);
     }
-    if !detection.zorder_anchor.is_invalid() {
-        mouse_hook::set_zorder_anchor(detection.zorder_anchor.0 as isize);
-    }
-
     apply_injection(our_hwnd, &detection);
     mouse_hook::init_dispatch_window();
 
@@ -613,9 +608,6 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
                             if !d.syslistview.is_invalid() {
                                 mouse_hook::set_syslistview_hwnd(d.syslistview.0 as isize);
                             }
-                            if !d.zorder_anchor.is_invalid() {
-                                mouse_hook::set_zorder_anchor(d.zorder_anchor.0 as isize);
-                            }
                             apply_injection(HWND(watchdog_our as *mut _), &d);
                             WATCHDOG_PARENT.store(d.target_parent.0 as isize, Ordering::SeqCst);
                             info!("[watchdog] Re-injection done");
@@ -654,6 +646,12 @@ pub mod mouse_hook {
     const MK_RBUTTON: i32 = 0x0002;
     const MK_MBUTTON: i32 = 0x0010;
 
+    // ListView messages for cross-process icon manipulation
+    const LVM_FIRST: u32 = 0x1000;
+    const LVM_SETITEMPOSITION: u32 = LVM_FIRST + 15; // 0x100F
+    const LVM_GETITEMPOSITION: u32 = LVM_FIRST + 16; // 0x1010
+    const LVM_HITTEST: u32 = LVM_FIRST + 18; // 0x1012
+
     static WEBVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static SYSLISTVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
     static TARGET_PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -664,16 +662,12 @@ pub mod mouse_hook {
     static DRAG_VK: AtomicIsize = AtomicIsize::new(0);
     static DISPATCH_HWND: AtomicIsize = AtomicIsize::new(0);
     static CHROME_RWHH: AtomicIsize = AtomicIsize::new(0);
-    #[allow(dead_code)]
-    static THREADS_ATTACHED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
 
     // Cached values to avoid syscalls in hook hot path
     static OUR_PID: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static ZORDER_ANCHOR: AtomicIsize = AtomicIsize::new(0);
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static DRAG_START_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DRAG_START_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -718,15 +712,7 @@ pub mod mouse_hook {
     pub fn get_chrome_rwhh_raw() -> isize {
         CHROME_RWHH.load(Ordering::SeqCst)
     }
-    pub fn set_zorder_anchor(h: isize) {
-        ZORDER_ANCHOR.store(h, Ordering::SeqCst);
-    }
-    pub fn get_zorder_anchor() -> isize {
-        ZORDER_ANCHOR.load(Ordering::SeqCst)
-    }
-    pub fn get_target_parent_hwnd() -> isize {
-        TARGET_PARENT_HWND.load(Ordering::SeqCst)
-    }
+
 
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
@@ -950,118 +936,10 @@ pub mod mouse_hook {
     /// Check if screen point is over a desktop icon via LVM_HITTEST.
     /// Cross-process: allocates the LVHITTESTINFO struct in explorer.exe's
     /// address space so SysListView32 can read the pointer from SendMessage.
+    /// Returns true if the screen point is over a desktop icon.
+    /// Thin wrapper around get_hit_item_index.
     unsafe fn hit_test_icon(slv: HWND, screen_pt: &windows::Win32::Foundation::POINT) -> bool {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::Graphics::Gdi::ScreenToClient;
-        use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-        use windows::Win32::System::Memory::{
-            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-        };
-        use windows::Win32::System::Threading::{
-            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-        };
-
-        let mut pt = *screen_pt;
-        let _ = ScreenToClient(slv, &mut pt);
-
-        const LVM_FIRST: u32 = 0x1000;
-        const LVM_HITTEST: u32 = LVM_FIRST + 18;
-
-        #[repr(C)]
-        struct LVHITTESTINFO {
-            pt: windows::Win32::Foundation::POINT,
-            flags: u32,
-            i_item: i32,
-            i_sub_item: i32,
-            i_group: i32,
-        }
-
-        let ht = LVHITTESTINFO {
-            pt,
-            flags: 0,
-            i_item: -1,
-            i_sub_item: 0,
-            i_group: 0,
-        };
-
-        // Open explorer.exe to allocate memory in its address space
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(slv, Some(&mut pid));
-        if pid == 0 {
-            log::debug!(
-                "[hit_test] GetWindowThreadProcessId returned pid=0 for slv=0x{:X}",
-                slv.0 as isize
-            );
-            return false;
-        }
-
-        let proc = match OpenProcess(
-            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
-            false,
-            pid,
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                log::debug!("[hit_test] OpenProcess failed for pid={}: {}", pid, e);
-                return false;
-            }
-        };
-
-        let size = std::mem::size_of::<LVHITTESTINFO>();
-        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote.is_null() {
-            log::debug!("[hit_test] VirtualAllocEx failed (null), pid={}", pid);
-            let _ = CloseHandle(proc);
-            return false;
-        }
-
-        // Write our struct into explorer's memory
-        if WriteProcessMemory(proc, remote, &ht as *const _ as _, size, None).is_err() {
-            log::debug!("[hit_test] WriteProcessMemory failed, pid={}", pid);
-            let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-            let _ = CloseHandle(proc);
-            return false;
-        }
-
-        // Send hit test (explorer reads the remote pointer)
-        let mut msg_result: usize = 0;
-        let send_ok = SendMessageTimeoutW(
-            slv,
-            LVM_HITTEST,
-            WPARAM(0),
-            LPARAM(remote as isize),
-            SMTO_ABORTIFHUNG,
-            100, // 100ms — generous for cross-process round-trip
-            Some(&mut msg_result),
-        );
-
-        // Read back the result
-        let mut ht_out = LVHITTESTINFO {
-            pt: windows::Win32::Foundation::POINT { x: 0, y: 0 },
-            flags: 0,
-            i_item: -1,
-            i_sub_item: 0,
-            i_group: 0,
-        };
-        let read_ok = ReadProcessMemory(proc, remote, &mut ht_out as *mut _ as _, size, None);
-
-        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-        let _ = CloseHandle(proc);
-
-        log::debug!(
-            "[hit_test] screen=({},{}) client=({},{}) send_ret={} msg_result={} read_ok={} i_item={} flags=0x{:X}",
-            screen_pt.x,
-            screen_pt.y,
-            pt.x,
-            pt.y,
-            send_ok.0,
-            msg_result,
-            read_ok.is_ok(),
-            ht_out.i_item,
-            ht_out.flags,
-        );
-
-        ht_out.i_item >= 0
+        get_hit_item_index(slv, screen_pt) >= 0
     }
 
     /// Same as hit_test_icon but returns the item index (-1 if no item).
@@ -1081,8 +959,6 @@ pub mod mouse_hook {
 
         let mut pt = *screen_pt;
         let _ = ScreenToClient(slv, &mut pt);
-
-        const LVM_HITTEST: u32 = 0x1000 + 18;
 
         #[repr(C)]
         struct LVHITTESTINFO {
@@ -1166,8 +1042,6 @@ pub mod mouse_hook {
         use windows::Win32::System::Threading::{
             OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
         };
-
-        const LVM_GETITEMPOSITION: u32 = 0x1000 + 16;
 
         let mut pid = 0u32;
         GetWindowThreadProcessId(slv, Some(&mut pid));
@@ -1361,33 +1235,6 @@ pub mod mouse_hook {
                 let _ = PostMessageW(slv, out_msg, slv_wparam, LPARAM(lp));
             }
 
-            /// Attach/detach Chrome_RWHH thread ↔ explorer thread input queues.
-            /// Currently unused: full-consume approach makes AttachThreadInput
-            /// unnecessary. Kept for potential future OLE drag-to-external use.
-            #[allow(dead_code)]
-            unsafe fn set_thread_attach(slv_raw: isize, attach: bool) {
-                extern "system" {
-                    fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
-                }
-
-                let rwhh_raw = CHROME_RWHH.load(Ordering::Relaxed);
-                if rwhh_raw == 0 || slv_raw == 0 {
-                    return;
-                }
-                let chrome_tid = GetWindowThreadProcessId(HWND(rwhh_raw as *mut _), None);
-                let explorer_tid = GetWindowThreadProcessId(HWND(slv_raw as *mut _), None);
-                if chrome_tid != 0 && explorer_tid != 0 && chrome_tid != explorer_tid {
-                    AttachThreadInput(chrome_tid, explorer_tid, i32::from(attach));
-                    THREADS_ATTACHED.store(attach, Ordering::Relaxed);
-                    log::info!(
-                        "[hook] AttachThreadInput({}, {}, {}) → shared key state",
-                        chrome_tid,
-                        explorer_tid,
-                        attach,
-                    );
-                }
-            }
-
             unsafe extern "system" fn hook_proc(
                 code: i32,
                 wparam: WPARAM,
@@ -1440,7 +1287,6 @@ pub mod mouse_hook {
                                 let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
                                 drop_pt.x -= off_x;
                                 drop_pt.y -= off_y;
-                                const LVM_SETITEMPOSITION: u32 = 0x100F;
                                 let lp = ((drop_pt.x as i16 as u16 as u32)
                                     | ((drop_pt.y as i16 as u16 as u32) << 16))
                                     as isize;
@@ -1479,7 +1325,6 @@ pub mod mouse_hook {
                                 let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
                                 cp.x -= off_x;
                                 cp.y -= off_y;
-                                const LVM_SETITEMPOSITION: u32 = 0x100F;
                                 let lp = ((cp.x as i16 as u16 as u32)
                                     | ((cp.y as i16 as u16 as u32) << 16))
                                     as isize;
