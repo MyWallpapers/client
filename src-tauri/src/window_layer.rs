@@ -1391,7 +1391,31 @@ pub mod mouse_hook {
                             }
                         }
                     } else if msg == WM_MOUSEMOVE {
-                        // Pas de post pour mousemove — juste pass through
+                        // Pendant le drag: déplacer l'icône en temps réel
+                        let start_x = DRAG_START_X.load(Ordering::Relaxed);
+                        let start_y = DRAG_START_Y.load(Ordering::Relaxed);
+                        let dx = (info_hook.pt.x - start_x).abs();
+                        let dy = (info_hook.pt.y - start_y).abs();
+                        let drag_cx = GetSystemMetrics(SM_CXDRAG);
+                        let drag_cy = GetSystemMetrics(SM_CYDRAG);
+                        if (dx > drag_cx || dy > drag_cy) && slv_raw != 0 {
+                            let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
+                            if item_idx >= 0 {
+                                let slv_h = HWND(slv_raw as *mut _);
+                                let mut cp = info_hook.pt;
+                                let _ = ScreenToClient(slv_h, &mut cp);
+                                const LVM_SETITEMPOSITION: u32 = 0x100F;
+                                let lp = ((cp.x as i16 as u16 as u32)
+                                    | ((cp.y as i16 as u16 as u32) << 16))
+                                    as isize;
+                                let _ = PostMessageW(
+                                    slv_h,
+                                    LVM_SETITEMPOSITION,
+                                    WPARAM(item_idx as usize),
+                                    LPARAM(lp),
+                                );
+                            }
+                        }
                     } else {
                         // Autres button events durant drag → post
                         if slv_raw != 0 {
