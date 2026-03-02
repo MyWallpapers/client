@@ -41,7 +41,10 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
         use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_HIDE, SW_SHOW,
+            WS_EX_TRANSPARENT,
+        };
         let slv = mouse_hook::get_syslistview_hwnd();
         if slv != 0 {
             unsafe {
@@ -58,10 +61,26 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
             if entering_interface { "INTERFACE" } else { "WALLPAPER" }
         );
 
-        // NE PAS toucher WS_EX_TRANSPARENT : SetWindowLongPtrW provoque un relayout
-        // du shell Windows qui fait disparaître le WebView (même effet que set_icon_passthrough).
-        // Interface mode : PostMessage direct à Chrome_RWHH (bypass les styles fenêtre).
-        // Wallpaper mode : CallNextHookEx natif pour les icônes + forward() pour le webview.
+        if !entering_interface {
+            // Wallpaper mode: re-ajouter WS_EX_TRANSPARENT sur Chrome_RWHH UNIQUEMENT.
+            // Chromium retire WS_EX_TRANSPARENT quand Chrome_RWHH reçoit des input (PostMessage
+            // en mode interface). Sans WS_EX_TRANSPARENT, WindowFromPoint retourne Chrome_RWHH
+            // et les hardware messages n'atteignent jamais SysListView32.
+            // NE PAS toucher le WebView HWND (cause disparition).
+            // NE PAS retirer en mode interface (PostMessage bypass les styles fenêtre).
+            let rwhh = mouse_hook::get_chrome_rwhh_raw();
+            if rwhh != 0 {
+                unsafe {
+                    let h = HWND(rwhh as *mut _);
+                    let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                    let new_ex = ex | (WS_EX_TRANSPARENT.0 as isize);
+                    if new_ex != ex {
+                        SetWindowLongPtrW(h, GWL_EXSTYLE, new_ex);
+                        info!("[window_layer] Re-added WS_EX_TRANSPARENT on Chrome_RWHH {:#x}", rwhh);
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
