@@ -442,7 +442,11 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<()> {
     use windows::Win32::Foundation::HWND;
 
-    let _ = window.set_ignore_cursor_events(false);
+    // Make the Tauri webview permanently transparent to mouse events.
+    // This lets SysListView32 (below) receive real OS events for icons
+    // (hover, select, drag, drop, rename, double-click).
+    // Wallpaper interactions are forwarded via PostMessageW in the hook.
+    let _ = window.set_ignore_cursor_events(true);
     let our_hwnd_raw = window.hwnd()?;
     let our_hwnd = HWND(our_hwnd_raw.0 as *mut _);
 
@@ -866,6 +870,13 @@ pub mod mouse_hook {
                         hwnd_under.0 as isize
                     );
                     CHROME_RWHH.store(hwnd_under.0 as isize, Ordering::Relaxed);
+                    // Apply WS_EX_TRANSPARENT to Chrome_RWHH as well so that
+                    // mouse events pass through to SysListView32 below.
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+                    };
+                    let ex = GetWindowLongPtrW(hwnd_under, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd_under, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as isize);
                     return true;
                 }
             }
@@ -1185,51 +1196,26 @@ pub mod mouse_hook {
                 let msg = wparam.0 as u32;
                 let slv_raw = SYSLISTVIEW_HWND.load(Ordering::Relaxed);
 
-                // ── Helper: set/restore WS_EX_TRANSPARENT on the webview windows ──
-                // When transparent, mouse events pass through to SysListView32 below.
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TRANSPARENT,
-                };
-                let set_icon_passthrough = |on: bool| {
-                    for raw in [
-                        WEBVIEW_HWND.load(Ordering::Relaxed),
-                        CHROME_RWHH.load(Ordering::Relaxed),
-                    ] {
-                        if raw != 0 {
-                            let ex = GetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE);
-                            let new_ex = if on {
-                                ex | WS_EX_TRANSPARENT.0 as isize
-                            } else {
-                                ex & !(WS_EX_TRANSPARENT.0 as isize)
-                            };
-                            if new_ex != ex {
-                                SetWindowLongPtrW(HWND(raw as *mut _), GWL_EXSTYLE, new_ex);
-                            }
-                        }
-                    }
-                };
-
                 // ── Not over desktop: pass through ──
                 if !is_over_desktop(hwnd_under) {
-                    set_icon_passthrough(false);
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
                 // ── Check if cursor is over a desktop icon ──
+                // WS_EX_TRANSPARENT is set permanently on the webview at startup
+                // (see setup_mouse_hook), so SysListView32 always receives real OS
+                // events — no toggling needed here.
                 let over_icon =
                     slv_raw != 0 && hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt);
 
                 if over_icon {
-                    // Make webview transparent → real OS events flow to SysListView32.
-                    // This enables: proper hover highlight, selection, DragDetect(),
-                    // DoDragDrop(), rename, double-click — all natively.
-                    set_icon_passthrough(true);
+                    // Real events flow directly to SysListView32 (webview is
+                    // permanently transparent). Hover, select, drag, drop, rename,
+                    // double-click all work natively.
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
-                // ── Not over an icon: restore opacity, handle as wallpaper ──
-                set_icon_passthrough(false);
-
+                // ── Wallpaper area: forward to webview for JS effects ──
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
                 let mut cp = info_hook.pt;
                 let _ = ScreenToClient(HWND(wv_raw as *mut _), &mut cp);
