@@ -1261,6 +1261,34 @@ pub mod mouse_hook {
 
                 // ── Not over desktop: pass through ──
                 if !is_over_desktop(hwnd_under) {
+                    // DEBUG: log every unknown class (throttle 500ms, deduplicate)
+                    if msg == WM_MOUSEMOVE {
+                        use std::sync::atomic::{AtomicI64, AtomicIsize};
+                        static LAST_LOG_T: AtomicI64 = AtomicI64::new(0);
+                        static LAST_HWND: AtomicIsize = AtomicIsize::new(0);
+                        let now = info_hook.time as i64;
+                        let prev_t = LAST_LOG_T.load(Ordering::Relaxed);
+                        let prev_h = LAST_HWND.load(Ordering::Relaxed);
+                        let h_raw = hwnd_under.0 as isize;
+                        if h_raw != prev_h || now.wrapping_sub(prev_t) > 500 {
+                            LAST_LOG_T.store(now, Ordering::Relaxed);
+                            LAST_HWND.store(h_raw, Ordering::Relaxed);
+                            let mut cls_buf = [0u16; 128];
+                            let cls_len = GetClassNameW(hwnd_under, &mut cls_buf) as usize;
+                            let cls = String::from_utf16_lossy(&cls_buf[..cls_len]);
+                            let mut pid: u32 = 0;
+                            GetWindowThreadProcessId(hwnd_under, Some(&mut pid));
+                            let parent = GetParent(hwnd_under).unwrap_or_default();
+                            let mut pcls_buf = [0u16; 128];
+                            let pcls_len = GetClassNameW(parent, &mut pcls_buf) as usize;
+                            let pcls = String::from_utf16_lossy(&pcls_buf[..pcls_len]);
+                            log::warn!(
+                                "[hook] MISS hwnd=0x{:X} class='{}' pid={} parent=0x{:X}[{}] pt=({},{})",
+                                h_raw, cls, pid, parent.0 as isize, pcls,
+                                info_hook.pt.x, info_hook.pt.y
+                            );
+                        }
+                    }
                     set_icon_passthrough(false);
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
