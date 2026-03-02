@@ -659,8 +659,6 @@ pub mod mouse_hook {
 
     // ListView messages for cross-process icon manipulation
     const LVM_FIRST: u32 = 0x1000;
-    const LVM_SETITEMPOSITION: u32 = LVM_FIRST + 15; // 0x100F
-    const LVM_GETITEMPOSITION: u32 = LVM_FIRST + 16; // 0x1010
     const LVM_HITTEST: u32 = LVM_FIRST + 18; // 0x1012
     const LVM_SETHOTITEM: u32 = LVM_FIRST + 60; // 0x103C
 
@@ -680,15 +678,9 @@ pub mod mouse_hook {
     static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_THRESHOLD_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
-    static DRAG_THRESHOLD_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
-    // Left-click drag state (icon repositioning via LVM_SETITEMPOSITION)
+    // Left-click drag state — forward all messages to SysListView32 so
+    // the native ListView drag (LVN_BEGINDRAG → DoDragDrop) kicks in.
     static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static DRAG_START_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_START_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-    static DRAG_OFFSET_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_OFFSET_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
     static RCLICK_ON_ICON: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1065,25 +1057,6 @@ pub mod mouse_hook {
         output.i_item
     }
 
-    /// Get icon position (client coords) via LVM_GETITEMPOSITION.
-    unsafe fn get_item_position(
-        slv: HWND,
-        item_index: i32,
-    ) -> Option<windows::Win32::Foundation::POINT> {
-        let input = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-        let mut output = windows::Win32::Foundation::POINT { x: 0, y: 0 };
-
-        let result = cross_process_lvm_send(
-            slv,
-            LVM_GETITEMPOSITION,
-            WPARAM(item_index as usize),
-            &input,
-            &mut output,
-        );
-
-        if result != 0 { Some(output) } else { None }
-    }
-
     #[inline]
     unsafe fn forward(msg: u32, info_hook: &MSLLHOOKSTRUCT, cx: i32, cy: i32) {
         match msg {
@@ -1148,8 +1121,6 @@ pub mod mouse_hook {
                 DBLCLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
                 DBLCLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK) / 2, Ordering::Relaxed);
                 DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
-                DRAG_THRESHOLD_CX.store(GetSystemMetrics(SM_CXDRAG), Ordering::Relaxed);
-                DRAG_THRESHOLD_CY.store(GetSystemMetrics(SM_CYDRAG), Ordering::Relaxed);
             }
 
             /// Post a mouse event to SysListView32, with double-click synthesis and key state.
@@ -1282,82 +1253,15 @@ pub mod mouse_hook {
                 }
 
                 // ── Left-click drag (icon repositioning) ──
-                // Only left-click initiates drag. On button-up: if moved past
-                // threshold, LVM_SETITEMPOSITION to reposition the icon.
+                // ── Left-click drag: forward all messages to SysListView32 ──
+                // The ListView handles drag detection (threshold), sends LVN_BEGINDRAG,
+                // and Explorer runs native DoDragDrop with ghost image + snap-to-grid.
                 if NATIVE_DRAG.load(Ordering::Relaxed) {
                     if msg == WM_LBUTTONUP {
                         NATIVE_DRAG.store(false, Ordering::Relaxed);
-                        let start_x = DRAG_START_X.load(Ordering::Relaxed);
-                        let start_y = DRAG_START_Y.load(Ordering::Relaxed);
-                        let dx = (info_hook.pt.x - start_x).abs();
-                        let dy = (info_hook.pt.y - start_y).abs();
-                        let drag_cx = DRAG_THRESHOLD_CX.load(Ordering::Relaxed);
-                        let drag_cy = DRAG_THRESHOLD_CY.load(Ordering::Relaxed);
-
-                        if dx > drag_cx || dy > drag_cy {
-                            let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
-                            if slv_raw != 0 && item_idx >= 0 {
-                                let slv_h = HWND(slv_raw as *mut _);
-                                let mut drop_pt = info_hook.pt;
-                                let _ = ScreenToClient(slv_h, &mut drop_pt);
-                                let off_x = DRAG_OFFSET_X.load(Ordering::Relaxed);
-                                let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
-                                drop_pt.x -= off_x;
-                                drop_pt.y -= off_y;
-                                let lp = ((drop_pt.x as i16 as u16 as u32)
-                                    | ((drop_pt.y as i16 as u16 as u32) << 16))
-                                    as isize;
-                                let _ = PostMessageW(
-                                    slv_h,
-                                    LVM_SETITEMPOSITION,
-                                    WPARAM(item_idx as usize),
-                                    LPARAM(lp),
-                                );
-                                log::info!(
-                                    "[hook] DRAG complete: item={} to client({},{})",
-                                    item_idx, drop_pt.x, drop_pt.y
-                                );
-                            }
-                        } else {
-                            // Simple click (no drag) → forward button-up
-                            if slv_raw != 0 {
-                                post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
-                            }
-                        }
-                    } else if msg == WM_MOUSEMOVE {
-                        // Live icon tracking during drag with grab offset
-                        let start_x = DRAG_START_X.load(Ordering::Relaxed);
-                        let start_y = DRAG_START_Y.load(Ordering::Relaxed);
-                        let dx = (info_hook.pt.x - start_x).abs();
-                        let dy = (info_hook.pt.y - start_y).abs();
-                        let drag_cx = DRAG_THRESHOLD_CX.load(Ordering::Relaxed);
-                        let drag_cy = DRAG_THRESHOLD_CY.load(Ordering::Relaxed);
-                        if (dx > drag_cx || dy > drag_cy) && slv_raw != 0 {
-                            let item_idx = DRAG_ITEM_INDEX.load(Ordering::Relaxed);
-                            if item_idx >= 0 {
-                                let slv_h = HWND(slv_raw as *mut _);
-                                let mut cp = info_hook.pt;
-                                let _ = ScreenToClient(slv_h, &mut cp);
-                                let off_x = DRAG_OFFSET_X.load(Ordering::Relaxed);
-                                let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
-                                cp.x -= off_x;
-                                cp.y -= off_y;
-                                let lp = ((cp.x as i16 as u16 as u32)
-                                    | ((cp.y as i16 as u16 as u32) << 16))
-                                    as isize;
-                                let _ = PostMessageW(
-                                    slv_h,
-                                    LVM_SETITEMPOSITION,
-                                    WPARAM(item_idx as usize),
-                                    LPARAM(lp),
-                                );
-                            }
-                        }
-                    } else {
-                        // Other button events during drag → post
-                        if slv_raw != 0 {
-                            post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
-                        }
+                    }
+                    if slv_raw != 0 {
+                        post_to_slv(HWND(slv_raw as *mut _), msg, &info_hook);
                     }
                     return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
@@ -1406,26 +1310,10 @@ pub mod mouse_hook {
                         let slv_h = HWND(slv_raw as *mut _);
 
                         if msg == WM_LBUTTONDOWN {
-                            // Left-click: initiate drag tracking
+                            // Left-click on icon: enter drag mode.
+                            // All subsequent messages are forwarded to SysListView32
+                            // until WM_LBUTTONUP — the native drag handles the rest.
                             NATIVE_DRAG.store(true, Ordering::Relaxed);
-                            DRAG_START_X.store(info_hook.pt.x, Ordering::Relaxed);
-                            DRAG_START_Y.store(info_hook.pt.y, Ordering::Relaxed);
-                            let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
-                            DRAG_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
-                            if item_idx >= 0 {
-                                if let Some(icon_pos) = get_item_position(slv_h, item_idx) {
-                                    let mut cursor_client = info_hook.pt;
-                                    let _ = ScreenToClient(slv_h, &mut cursor_client);
-                                    DRAG_OFFSET_X.store(cursor_client.x - icon_pos.x, Ordering::Relaxed);
-                                    DRAG_OFFSET_Y.store(cursor_client.y - icon_pos.y, Ordering::Relaxed);
-                                }
-                            }
-                            log::info!(
-                                "[hook] NATIVE_DRAG start at ({},{}) item={} offset=({},{})",
-                                info_hook.pt.x, info_hook.pt.y, item_idx,
-                                DRAG_OFFSET_X.load(Ordering::Relaxed),
-                                DRAG_OFFSET_Y.load(Ordering::Relaxed),
-                            );
                         } else {
                             // Right-click: track for context menu
                             RCLICK_ON_ICON.store(true, Ordering::Relaxed);
