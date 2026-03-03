@@ -273,11 +273,11 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
     use std::mem::{size_of, zeroed};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
-    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR};
-    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, DEVMODEW,
+        ENUM_CURRENT_SETTINGS,
     };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
     // MONITORINFOEXW layout — cbSize distinguishes it from plain MONITORINFO.
     #[repr(C)]
@@ -373,8 +373,9 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
 #[cfg(target_os = "windows")]
 fn collect_audio_info() -> Option<AudioInfo> {
     use windows::Win32::Media::Audio::{
-        eMultimedia, eRender, IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator,
+        eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
     };
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
