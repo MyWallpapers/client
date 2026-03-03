@@ -59,7 +59,11 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
         INTERFACE_MODE.store(entering_interface, Ordering::Relaxed);
         info!(
             "[window_layer] Mode switch: {}",
-            if entering_interface { "INTERFACE" } else { "WALLPAPER" }
+            if entering_interface {
+                "INTERFACE"
+            } else {
+                "WALLPAPER"
+            }
         );
 
         if !entering_interface {
@@ -77,7 +81,10 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
                     let new_ex = ex | (WS_EX_TRANSPARENT.0 as isize);
                     if new_ex != ex {
                         SetWindowLongPtrW(h, GWL_EXSTYLE, new_ex);
-                        info!("[window_layer] Re-added WS_EX_TRANSPARENT on Chrome_RWHH {:#x}", rwhh);
+                        info!(
+                            "[window_layer] Re-added WS_EX_TRANSPARENT on Chrome_RWHH {:#x}",
+                            rwhh
+                        );
                     }
                 }
             }
@@ -704,14 +711,11 @@ pub mod mouse_hook {
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
     static RCLICK_ON_ICON: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    static RCLICK_ITEM_INDEX: std::sync::atomic::AtomicI32 =
-        std::sync::atomic::AtomicI32::new(-1);
+    static RCLICK_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
     // Hover tracking — LVM_SETHOTITEM (PostMessage(WM_MOUSEMOVE) doesn't work
     // because ListView's hot-tracking checks real cursor pos via GetCursorPos)
-    static CURRENT_HOT_ITEM: std::sync::atomic::AtomicI32 =
-        std::sync::atomic::AtomicI32::new(-1);
-    static LAST_HOVER_TICK: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static CURRENT_HOT_ITEM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static LAST_HOVER_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Cached explorer process handle + remote buffer for cross-process LVM ops.
     // Avoids OpenProcess/VirtualAllocEx/VirtualFreeEx/CloseHandle per call.
     static CACHED_PROC_HANDLE: AtomicIsize = AtomicIsize::new(0);
@@ -755,7 +759,6 @@ pub mod mouse_hook {
     pub fn invalidate_proc_cache_pub() {
         unsafe { invalidate_proc_cache() }
     }
-
 
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
@@ -981,10 +984,7 @@ pub mod mouse_hook {
     /// The cache is invalidated when PID changes (explorer restart).
     unsafe fn ensure_cached_proc(
         pid: u32,
-    ) -> Option<(
-        windows::Win32::Foundation::HANDLE,
-        *mut std::ffi::c_void,
-    )> {
+    ) -> Option<(windows::Win32::Foundation::HANDLE, *mut std::ffi::c_void)> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Memory::{
             VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -1109,10 +1109,7 @@ pub mod mouse_hook {
     }
 
     /// Returns the item index under screen_pt (-1 if no item).
-    unsafe fn get_hit_item_index(
-        slv: HWND,
-        screen_pt: &windows::Win32::Foundation::POINT,
-    ) -> i32 {
+    unsafe fn get_hit_item_index(slv: HWND, screen_pt: &windows::Win32::Foundation::POINT) -> i32 {
         use windows::Win32::Graphics::Gdi::ScreenToClient;
 
         let mut pt = *screen_pt;
@@ -1162,7 +1159,11 @@ pub mod mouse_hook {
             &mut output,
         );
 
-        if result != 0 { Some(output) } else { None }
+        if result != 0 {
+            Some(output)
+        } else {
+            None
+        }
     }
 
     /// Get item bounding rect (client coords) via LVM_GETITEMRECT.
@@ -1272,7 +1273,7 @@ pub mod mouse_hook {
     /// End the ghost drag: cleanup ImageList resources.
     unsafe fn end_drag_ghost() {
         use windows::Win32::UI::Controls::{
-            ImageList_DragLeave, ImageList_Destroy, ImageList_EndDrag, HIMAGELIST,
+            ImageList_Destroy, ImageList_DragLeave, ImageList_EndDrag, HIMAGELIST,
         };
         use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
 
@@ -1524,12 +1525,7 @@ pub mod mouse_hook {
                                 WPARAM(MK_LBUTTON as usize),
                                 LPARAM(lp),
                             );
-                            let _ = PostMessageW(
-                                slv_h,
-                                WM_LBUTTONUP,
-                                WPARAM(0),
-                                LPARAM(lp),
-                            );
+                            let _ = PostMessageW(slv_h, WM_LBUTTONUP, WPARAM(0), LPARAM(lp));
                             // Context menu using the now-natively-selected item
                             let _ = PostMessageW(
                                 slv_h,
@@ -1576,7 +1572,9 @@ pub mod mouse_hook {
                                 );
                                 log::debug!(
                                     "[hook] DRAG complete: item={} to client({},{})",
-                                    item_idx, drop_pt.x, drop_pt.y
+                                    item_idx,
+                                    drop_pt.x,
+                                    drop_pt.y
                                 );
                             }
                         } else {
@@ -1674,12 +1672,16 @@ pub mod mouse_hook {
                             if let Some(icon_pos) = get_item_position(slv_h, item_idx) {
                                 let mut cursor_client = info_hook.pt;
                                 let _ = ScreenToClient(slv_h, &mut cursor_client);
-                                DRAG_OFFSET_X.store(cursor_client.x - icon_pos.x, Ordering::Relaxed);
-                                DRAG_OFFSET_Y.store(cursor_client.y - icon_pos.y, Ordering::Relaxed);
+                                DRAG_OFFSET_X
+                                    .store(cursor_client.x - icon_pos.x, Ordering::Relaxed);
+                                DRAG_OFFSET_Y
+                                    .store(cursor_client.y - icon_pos.y, Ordering::Relaxed);
                             }
                             log::debug!(
                                 "[hook] NATIVE_DRAG start at ({},{}) item={} offset=({},{})",
-                                info_hook.pt.x, info_hook.pt.y, item_idx,
+                                info_hook.pt.x,
+                                info_hook.pt.y,
+                                item_idx,
                                 DRAG_OFFSET_X.load(Ordering::Relaxed),
                                 DRAG_OFFSET_Y.load(Ordering::Relaxed),
                             );
@@ -1691,7 +1693,9 @@ pub mod mouse_hook {
                             RCLICK_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
                             log::debug!(
                                 "[hook] RCLICK on icon item={} at ({},{})",
-                                item_idx, info_hook.pt.x, info_hook.pt.y
+                                item_idx,
+                                info_hook.pt.x,
+                                info_hook.pt.y
                             );
                             // Eat WM_RBUTTONDOWN — prevents native desktop menu.
                             // Selection + WM_CONTEXTMENU handled on button-up.
@@ -1770,12 +1774,7 @@ pub mod mouse_hook {
                     | (if is_up { 1u32 << 30 } else { 0 })
                     | (if is_up { 1u32 << 31 } else { 0 })) as isize;
 
-                let _ = PostMessageW(
-                    rwhh_hwnd,
-                    msg,
-                    WPARAM(kb.vkCode as usize),
-                    LPARAM(lp),
-                );
+                let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(kb.vkCode as usize), LPARAM(lp));
 
                 // Generate WM_CHAR for key-down events (text input)
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
@@ -1785,13 +1784,7 @@ pub mod mouse_hook {
                     let mut kb_state = [0u8; 256];
                     let _ = GetKeyboardState(&mut kb_state);
                     let mut chars = [0u16; 4];
-                    let count = ToUnicode(
-                        kb.vkCode,
-                        kb.scanCode,
-                        Some(&kb_state),
-                        &mut chars,
-                        0,
-                    );
+                    let count = ToUnicode(kb.vkCode, kb.scanCode, Some(&kb_state), &mut chars, 0);
                     let char_msg = if is_sys { WM_SYSCHAR } else { WM_CHAR };
                     for i in 0..count.max(0) as usize {
                         let _ = PostMessageW(
@@ -1810,8 +1803,7 @@ pub mod mouse_hook {
                 if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
                     crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
                 }
-                if let Ok(h) =
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
+                if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
                 {
                     crate::window_layer::KB_HOOK_HANDLE_GLOBAL
                         .store(h.0 as isize, Ordering::SeqCst);
