@@ -22,6 +22,7 @@ static INTERFACE_MODE: AtomicBool = AtomicBool::new(false);
 // Public API
 // ==============================================================================
 
+#[allow(unused_variables)]
 pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
     #[cfg(target_os = "windows")]
     {
@@ -38,6 +39,7 @@ pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
 }
 
 #[tauri::command]
+#[allow(unused_variables)]
 pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
