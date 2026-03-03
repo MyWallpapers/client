@@ -95,14 +95,25 @@ pub fn set_desktop_icons_visible(visible: bool) -> crate::error::AppResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn unhook_global(handle: &AtomicIsize, name: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{UnhookWindowsHookEx, HHOOK};
+    let ptr = handle.load(Ordering::SeqCst);
+    if ptr != 0 {
+        unsafe {
+            if let Err(e) = UnhookWindowsHookEx(HHOOK(ptr as *mut _)) {
+                error!("[window_layer] Unhook {} failed: {:?}", name, e);
+            }
+        }
+    }
+}
+
 pub fn restore_desktop_icons_and_unhook() {
     if !ICONS_RESTORED.swap(true, Ordering::SeqCst) {
         #[cfg(target_os = "windows")]
         {
             use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{
-                ShowWindow, UnhookWindowsHookEx, HHOOK, SW_SHOW,
-            };
+            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOW};
 
             let slv = mouse_hook::get_syslistview_hwnd();
             if slv != 0 {
@@ -112,23 +123,8 @@ pub fn restore_desktop_icons_and_unhook() {
                 }
             }
 
-            let hook_ptr = HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
-            if hook_ptr != 0 {
-                unsafe {
-                    if let Err(e) = UnhookWindowsHookEx(HHOOK(hook_ptr as *mut _)) {
-                        error!("[window_layer] Unhook mouse hook failed: {:?}", e);
-                    }
-                }
-            }
-
-            let kb_hook_ptr = KB_HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
-            if kb_hook_ptr != 0 {
-                unsafe {
-                    if let Err(e) = UnhookWindowsHookEx(HHOOK(kb_hook_ptr as *mut _)) {
-                        error!("[window_layer] Unhook keyboard hook failed: {:?}", e);
-                    }
-                }
-            }
+            unhook_global(&HOOK_HANDLE_GLOBAL, "mouse hook");
+            unhook_global(&KB_HOOK_HANDLE_GLOBAL, "keyboard hook");
 
             // Free cached explorer process handle + remote buffer
             mouse_hook::invalidate_proc_cache_pub();
@@ -653,7 +649,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -693,28 +689,26 @@ pub mod mouse_hook {
     // Cached values to avoid syscalls in hook hot path
     static OUR_PID: AtomicU32 = AtomicU32::new(0);
     static DBLCLICK_TIME: AtomicU32 = AtomicU32::new(0);
-    static DBLCLICK_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DBLCLICK_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_THRESHOLD_CX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
-    static DRAG_THRESHOLD_CY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(4);
+    static DBLCLICK_CX: AtomicI32 = AtomicI32::new(0);
+    static DBLCLICK_CY: AtomicI32 = AtomicI32::new(0);
+    static DRAG_THRESHOLD_CX: AtomicI32 = AtomicI32::new(4);
+    static DRAG_THRESHOLD_CY: AtomicI32 = AtomicI32::new(4);
     // Left-click drag state (icon repositioning via LVM_SETITEMPOSITION)
-    static NATIVE_DRAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static DRAG_START_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_START_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-    static DRAG_OFFSET_X: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_OFFSET_Y: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    static DRAG_PAST_THRESHOLD: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static NATIVE_DRAG: AtomicBool = AtomicBool::new(false);
+    static DRAG_START_X: AtomicI32 = AtomicI32::new(0);
+    static DRAG_START_Y: AtomicI32 = AtomicI32::new(0);
+    static DRAG_ITEM_INDEX: AtomicI32 = AtomicI32::new(-1);
+    static DRAG_OFFSET_X: AtomicI32 = AtomicI32::new(0);
+    static DRAG_OFFSET_Y: AtomicI32 = AtomicI32::new(0);
+    static DRAG_PAST_THRESHOLD: AtomicBool = AtomicBool::new(false);
     static DRAG_GHOST_HIML: AtomicIsize = AtomicIsize::new(0);
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
-    static RCLICK_ON_ICON: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    static RCLICK_ITEM_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static RCLICK_ON_ICON: AtomicBool = AtomicBool::new(false);
+    static RCLICK_ITEM_INDEX: AtomicI32 = AtomicI32::new(-1);
     // Hover tracking — LVM_SETHOTITEM (PostMessage(WM_MOUSEMOVE) doesn't work
     // because ListView's hot-tracking checks real cursor pos via GetCursorPos)
-    static CURRENT_HOT_ITEM: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-    static LAST_HOVER_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CURRENT_HOT_ITEM: AtomicI32 = AtomicI32::new(-1);
+    static LAST_HOVER_TICK: AtomicU64 = AtomicU64::new(0);
     // Cached explorer process handle + remote buffer for cross-process LVM ops.
     // Avoids OpenProcess/VirtualAllocEx/VirtualFreeEx/CloseHandle per call.
     static CACHED_PROC_HANDLE: AtomicIsize = AtomicIsize::new(0);
@@ -722,8 +716,9 @@ pub mod mouse_hook {
     static CACHED_REMOTE_BUF: AtomicIsize = AtomicIsize::new(0);
     const CACHED_BUF_SIZE: usize = 256; // enough for any LV struct
 
-    pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
-    const WM_MWP_MOUSE: u32 = 0x8000 + 42;
+    const WM_APP: u32 = 0x8000;
+    pub const WM_MWP_SETBOUNDS_PUB: u32 = WM_APP + 43;
+    const WM_MWP_MOUSE: u32 = WM_APP + 42;
 
     pub fn set_webview_hwnd(h: isize) {
         WEBVIEW_HWND.store(h, Ordering::SeqCst);
@@ -759,6 +754,12 @@ pub mod mouse_hook {
         unsafe { invalidate_proc_cache() }
     }
 
+    /// Pack two i32 screen/client coordinates into a Windows lParam isize.
+    #[inline]
+    fn make_lparam(x: i32, y: i32) -> isize {
+        ((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize
+    }
+
     #[inline]
     unsafe fn post_mouse(kind: i32, vk: i32, data: u32, x: i32, y: i32) {
         // Encoding packs 3 fields into a single usize via bit shifts.
@@ -773,9 +774,13 @@ pub mod mouse_hook {
         }
         let wp =
             WPARAM((kind as u16 as usize) | ((vk as u16 as usize) << 16) | ((data as usize) << 32));
-        let lp = LPARAM(((x as i16 as u16 as u32) | ((y as i16 as u16 as u32) << 16)) as isize);
+        let lp = LPARAM(make_lparam(x, y));
         let _ = PostMessageW(HWND(dh as *mut _), WM_MWP_MOUSE, wp, lp);
     }
+
+    const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+    const WTS_SESSION_LOCK: u32 = 0x7;
+    const WTS_SESSION_UNLOCK: u32 = 0x8;
 
     unsafe extern "system" fn dispatch_wnd_proc(
         hwnd: HWND,
@@ -808,10 +813,6 @@ pub mod mouse_hook {
             return LRESULT(0);
         }
         // WTS session lock/unlock notifications
-        const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
-        const WTS_SESSION_LOCK: u32 = 0x7;
-        const WTS_SESSION_UNLOCK: u32 = 0x8;
-
         if msg == WM_WTSSESSION_CHANGE {
             match wp.0 as u32 {
                 WTS_SESSION_LOCK => {
@@ -857,8 +858,8 @@ pub mod mouse_hook {
 
                 // Register for session lock/unlock notifications
                 use windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
-                // NOTIFY_FOR_THIS_SESSION = 0x0
-                let _ = WTSRegisterSessionNotification(h, 0);
+                const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+                let _ = WTSRegisterSessionNotification(h, NOTIFY_FOR_THIS_SESSION);
             }
         }
     }
@@ -986,7 +987,7 @@ pub mod mouse_hook {
     ) -> Option<(windows::Win32::Foundation::HANDLE, *mut std::ffi::c_void)> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Memory::{
-            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
         };
         use windows::Win32::System::Threading::{
             OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
@@ -1005,16 +1006,7 @@ pub mod mouse_hook {
         }
 
         // Invalidate old cache
-        let old_h = CACHED_PROC_HANDLE.swap(0, Ordering::Relaxed);
-        let old_buf = CACHED_REMOTE_BUF.swap(0, Ordering::Relaxed);
-        CACHED_PROC_PID.store(0, Ordering::Relaxed);
-        if old_h != 0 {
-            let handle = windows::Win32::Foundation::HANDLE(old_h as *mut _);
-            if old_buf != 0 {
-                let _ = VirtualFreeEx(handle, old_buf as *mut _, 0, MEM_RELEASE);
-            }
-            let _ = CloseHandle(handle);
-        }
+        invalidate_proc_cache();
 
         let proc = OpenProcess(
             PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
@@ -1158,11 +1150,7 @@ pub mod mouse_hook {
             &mut output,
         );
 
-        if result != 0 {
-            Some(output)
-        } else {
-            None
-        }
+        (result != 0).then_some(output)
     }
 
     /// Get item bounding rect (client coords) via LVM_GETITEMRECT.
@@ -1186,11 +1174,7 @@ pub mod mouse_hook {
             &input,
             &mut output,
         );
-        if result != 0 {
-            Some(output)
-        } else {
-            None
-        }
+        (result != 0).then_some(output)
     }
 
     /// Begin ImageList ghost drag: capture icon area from screen, show as drag overlay.
@@ -1363,25 +1347,19 @@ pub mod mouse_hook {
                 }
 
                 let lp = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
-                    ((info_hook.pt.x as i16 as u16 as u32)
-                        | ((info_hook.pt.y as i16 as u16 as u32) << 16))
-                        as isize
+                    make_lparam(info_hook.pt.x, info_hook.pt.y)
                 } else {
                     let mut slv_cp = info_hook.pt;
                     let _ = ScreenToClient(slv, &mut slv_cp);
-                    ((slv_cp.x as i16 as u16 as u32) | ((slv_cp.y as i16 as u16 as u32) << 16))
-                        as isize
+                    make_lparam(slv_cp.x, slv_cp.y)
                 };
 
                 // Synthesize double-click (PostMessage bypasses native detection)
                 let mut out_msg = msg;
                 if msg == WM_LBUTTONDOWN {
-                    static LAST_DOWN_TIME: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    static LAST_DOWN_X: std::sync::atomic::AtomicI32 =
-                        std::sync::atomic::AtomicI32::new(0);
-                    static LAST_DOWN_Y: std::sync::atomic::AtomicI32 =
-                        std::sync::atomic::AtomicI32::new(0);
+                    static LAST_DOWN_TIME: AtomicU32 = AtomicU32::new(0);
+                    static LAST_DOWN_X: AtomicI32 = AtomicI32::new(0);
+                    static LAST_DOWN_Y: AtomicI32 = AtomicI32::new(0);
 
                     let now = info_hook.time;
                     let dt = now.saturating_sub(LAST_DOWN_TIME.load(Ordering::Relaxed));
@@ -1470,9 +1448,7 @@ pub mod mouse_hook {
                             // (LVM_SETITEMSTATE alone doesn't set all internal shell state)
                             let mut slv_cp = info_hook.pt;
                             let _ = ScreenToClient(slv_h, &mut slv_cp);
-                            let lp = ((slv_cp.x as i16 as u16 as u32)
-                                | ((slv_cp.y as i16 as u16 as u32) << 16))
-                                as isize;
+                            let lp = make_lparam(slv_cp.x, slv_cp.y);
                             let _ = PostMessageW(
                                 slv_h,
                                 WM_LBUTTONDOWN,
@@ -1515,9 +1491,7 @@ pub mod mouse_hook {
                                 let off_y = DRAG_OFFSET_Y.load(Ordering::Relaxed);
                                 drop_pt.x -= off_x;
                                 drop_pt.y -= off_y;
-                                let lp = ((drop_pt.x as i16 as u16 as u32)
-                                    | ((drop_pt.y as i16 as u16 as u32) << 16))
-                                    as isize;
+                                let lp = make_lparam(drop_pt.x, drop_pt.y);
                                 let _ = PostMessageW(
                                     slv_h,
                                     LVM_SETITEMPOSITION,
@@ -1584,9 +1558,7 @@ pub mod mouse_hook {
                         let rwhh_hwnd = HWND(rwhh as *mut _);
                         match msg {
                             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                                let lp = ((info_hook.pt.x as i16 as u16 as u32)
-                                    | ((info_hook.pt.y as i16 as u16 as u32) << 16))
-                                    as isize;
+                                let lp = make_lparam(info_hook.pt.x, info_hook.pt.y);
                                 let delta = (info_hook.mouseData >> 16) as i16 as u16;
                                 let wp = (delta as usize) << 16;
                                 let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(wp), LPARAM(lp));
@@ -1594,9 +1566,7 @@ pub mod mouse_hook {
                             _ => {
                                 let mut cp = info_hook.pt;
                                 let _ = ScreenToClient(rwhh_hwnd, &mut cp);
-                                let lp = ((cp.x as i16 as u16 as u32)
-                                    | ((cp.y as i16 as u16 as u32) << 16))
-                                    as isize;
+                                let lp = make_lparam(cp.x, cp.y);
                                 let wp = match msg {
                                     WM_LBUTTONDOWN => MK_LBUTTON as usize,
                                     WM_RBUTTONDOWN => MK_RBUTTON as usize,

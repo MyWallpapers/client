@@ -13,6 +13,8 @@ pub enum AppError {
     OAuth(String),
     #[error("Media: {0}")]
     Media(String),
+    #[error("Discord: {0}")]
+    Discord(String),
     #[error(transparent)]
     Tauri(#[from] tauri::Error),
     #[error("IO: {0}")]

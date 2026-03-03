@@ -15,6 +15,12 @@ use log::{error, info, warn};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+// Timing constants for the WebView heartbeat watchdog
+const HEARTBEAT_GRACE_SECS: u64 = 30;
+const HEARTBEAT_POLL_SECS: u64 = 5;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+const MONITOR_INTERVAL_SECS: u64 = 3;
+
 static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     format!(
         r#"window.__MW_INIT__ = {{ isTauri: true, platform: "{}", arch: "{}", appVersion: "{}", tauriVersion: "{}", debug: {} }};"#,
@@ -26,34 +32,39 @@ static MW_INIT_SCRIPT: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-pub fn main() {
-    // Keep at most 5 log files, delete older ones.
-    #[cfg(target_os = "windows")]
-    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) {
-        let log_dir = base.join("com.mywallpaper.desktop").join("logs");
-        if let Ok(canonical) = log_dir.canonicalize() {
-            if canonical.starts_with(base.canonicalize().unwrap_or_default()) {
-                if let Ok(mut logs) = std::fs::read_dir(&canonical).map(|rd| {
-                    rd.flatten()
-                        .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
-                        .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
-                        .collect::<Vec<_>>()
-                }) {
-                    logs.sort_by(|a, b| b.1.cmp(&a.1));
-                    logs.into_iter().skip(5).for_each(|(p, _)| {
-                        let _ = std::fs::remove_file(p);
-                    });
-                }
-            }
-        }
-    }
+fn unix_secs() -> u64 {
+    std::time::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or_default()
+        .as_secs()
+}
 
-    info!(
-        "[main] Starting MyWallpaper Desktop v{} ({}/{})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+/// Keep at most 5 log files, delete older ones.
+#[cfg(target_os = "windows")]
+fn rotate_logs() -> Option<()> {
+    let base = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    let log_dir = base.join("com.mywallpaper.desktop").join("logs");
+    let canonical = log_dir.canonicalize().ok()?;
+    if !canonical.starts_with(base.canonicalize().unwrap_or_default()) {
+        return None;
+    }
+    let mut logs: Vec<_> = std::fs::read_dir(&canonical)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+        .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
+        .collect();
+    logs.sort_by(|a, b| b.1.cmp(&a.1));
+    logs.into_iter().skip(5).for_each(|(p, _)| {
+        let _ = std::fs::remove_file(p);
+    });
+    Some(())
+}
+
+pub fn main() {
+    #[cfg(target_os = "windows")]
+    rotate_logs();
+
     start_with_tauri_webview();
 }
 
@@ -98,13 +109,14 @@ fn start_with_tauri_webview() {
                 });
         }))
         .on_page_load(|webview, payload| {
-            if payload.event() == PageLoadEvent::Started {
-                let _ = webview.eval(&*MW_INIT_SCRIPT);
-            }
-            if payload.event() == PageLoadEvent::Finished {
-                // Heartbeat: frontend pings every 5s so backend can detect unresponsive WebView
-                let _ = webview.eval(
-                    r#"
+            match payload.event() {
+                PageLoadEvent::Started => {
+                    let _ = webview.eval(&*MW_INIT_SCRIPT);
+                }
+                PageLoadEvent::Finished => {
+                    // Heartbeat: frontend pings every 5s so backend can detect unresponsive WebView
+                    let _ = webview.eval(
+                        r#"
                     if (!window.__MW_HEARTBEAT__) {
                         window.__MW_HEARTBEAT__ = true;
                         setInterval(() => {
@@ -114,11 +126,21 @@ fn start_with_tauri_webview() {
                         }, 5000);
                     }
                     "#,
-                );
+                    );
+                }
+                _ => {}
             }
         })
         .setup(|app| {
             let handle = app.handle().clone();
+
+            info!(
+                "[main] Starting MyWallpaper Desktop v{} ({}/{})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+
             if let Err(e) = tray::setup_tray(&handle) {
                 error!("[setup] Failed to setup system tray: {}", e);
             }
@@ -140,20 +162,14 @@ fn start_with_tauri_webview() {
                 let _ = window.show();
             }
 
-            system_monitor::start_monitor(handle.clone(), 3);
+            system_monitor::start_monitor(handle.clone(), MONITOR_INTERVAL_SECS);
             discord::init();
 
             // WebView heartbeat watchdog — auto-reload if frontend stops responding
-            fn now_secs() -> u64 {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }
-            let last_heartbeat = Arc::new(AtomicU64::new(now_secs()));
+            let last_heartbeat = Arc::new(AtomicU64::new(unix_secs()));
             let hb = last_heartbeat.clone();
             handle.listen("webview-heartbeat", move |_| {
-                hb.store(now_secs(), Ordering::Relaxed);
+                hb.store(unix_secs(), Ordering::Relaxed);
             });
 
             let hb_handle = handle.clone();
@@ -162,15 +178,15 @@ fn start_with_tauri_webview() {
                 use std::time::Duration;
                 use tauri::Manager;
                 // Grace period for initial page load
-                std::thread::sleep(Duration::from_secs(30));
+                std::thread::sleep(Duration::from_secs(HEARTBEAT_GRACE_SECS));
                 loop {
-                    std::thread::sleep(Duration::from_secs(5));
-                    let elapsed = now_secs() - hb_ref.load(Ordering::Relaxed);
-                    if elapsed > 15 {
+                    std::thread::sleep(Duration::from_secs(HEARTBEAT_POLL_SECS));
+                    let elapsed = unix_secs() - hb_ref.load(Ordering::Relaxed);
+                    if elapsed > HEARTBEAT_TIMEOUT_SECS {
                         warn!("[heartbeat] WebView unresponsive ({}s), reloading", elapsed);
                         if let Some(w) = hb_handle.get_webview_window("main") {
                             let _ = w.eval("window.location.reload()");
-                            hb_ref.store(now_secs(), Ordering::Relaxed);
+                            hb_ref.store(unix_secs(), Ordering::Relaxed);
                         }
                     }
                 }

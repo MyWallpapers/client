@@ -7,6 +7,8 @@ use log::info;
 use serde::Serialize;
 use typeshare::typeshare;
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -46,7 +48,8 @@ fn validate_categories(categories: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn validate_updater_endpoint(url: &str) -> AppResult<()> {
+/// Parse and validate the updater endpoint URL, returning the parsed URL on success.
+fn validate_updater_endpoint(url: &str) -> AppResult<url::Url> {
     let parsed =
         url::Url::parse(url).map_err(|_| AppError::Validation("Invalid endpoint URL".into()))?;
     if parsed.scheme() != "https" {
@@ -65,7 +68,11 @@ fn validate_updater_endpoint(url: &str) -> AppResult<()> {
             "Endpoint must point to MyWallpapers/client releases".into(),
         ));
     }
-    Ok(())
+    Ok(parsed)
+}
+
+fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
 }
 
 pub fn validate_oauth_url(url_str: &str) -> AppResult<()> {
@@ -90,7 +97,7 @@ pub fn validate_oauth_url(url_str: &str) -> AppResult<()> {
     }
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
-            if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            if is_private_ipv4(ip) {
                 return Err(AppError::Validation(
                     "HTTPS to private/internal IPs is not allowed".into(),
                 ));
@@ -108,13 +115,10 @@ pub fn validate_oauth_url(url_str: &str) -> AppResult<()> {
                     "HTTPS to private/internal IPs is not allowed".into(),
                 ));
             }
-            if let Some(v4) = ip.to_ipv4_mapped() {
-                if v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
-                {
-                    return Err(AppError::Validation(
-                        "HTTPS to private/internal IPs is not allowed".into(),
-                    ));
-                }
+            if ip.to_ipv4_mapped().is_some_and(is_private_ipv4) {
+                return Err(AppError::Validation(
+                    "HTTPS to private/internal IPs is not allowed".into(),
+                ));
             }
         }
         _ => {}
@@ -122,24 +126,25 @@ pub fn validate_oauth_url(url_str: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn parse_semver(v: &str) -> AppResult<(u32, u32, u32)> {
+    let v = v.trim_start_matches('v');
+    let v = v.split('-').next().unwrap_or(v);
+    let p: Vec<&str> = v.split('.').collect();
+    if p.len() != 3 {
+        return Err(AppError::Validation(format!("Invalid version: {}", v)));
+    }
+    Ok((
+        p[0].parse()
+            .map_err(|_| AppError::Validation("bad major".into()))?,
+        p[1].parse()
+            .map_err(|_| AppError::Validation("bad minor".into()))?,
+        p[2].parse()
+            .map_err(|_| AppError::Validation("bad patch".into()))?,
+    ))
+}
+
 fn validate_update_version(current: &str, candidate: &str) -> AppResult<()> {
-    let parse = |v: &str| -> AppResult<(u32, u32, u32)> {
-        let v = v.trim_start_matches('v');
-        let v = v.split('-').next().unwrap_or(v);
-        let p: Vec<&str> = v.split('.').collect();
-        if p.len() != 3 {
-            return Err(AppError::Validation(format!("Invalid version: {}", v)));
-        }
-        Ok((
-            p[0].parse()
-                .map_err(|_| AppError::Validation("bad major".into()))?,
-            p[1].parse()
-                .map_err(|_| AppError::Validation("bad minor".into()))?,
-            p[2].parse()
-                .map_err(|_| AppError::Validation("bad patch".into()))?,
-        ))
-    };
-    if parse(candidate)? < parse(current)? {
+    if parse_semver(candidate)? < parse_semver(current)? {
         return Err(AppError::Validation(format!(
             "Refusing downgrade from {} to {}",
             current, candidate
@@ -173,7 +178,7 @@ pub fn get_system_info() -> SystemInfo {
         os: std::env::consts::OS.to_string(),
         os_version: os_info::get().version().to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        app_version: APP_VERSION.to_string(),
         tauri_version: tauri::VERSION.to_string(),
     }
 }
@@ -194,10 +199,7 @@ fn build_updater(
 ) -> AppResult<tauri_plugin_updater::Updater> {
     use tauri_plugin_updater::UpdaterExt;
     if let Some(url) = endpoint {
-        validate_updater_endpoint(&url)?;
-        let parsed: url::Url = url
-            .parse()
-            .map_err(|e| AppError::Updater(format!("Invalid URL: {}", e)))?;
+        let parsed = validate_updater_endpoint(&url)?;
         app.updater_builder()
             .endpoints(vec![parsed])
             .map_err(|e| AppError::Updater(format!("Invalid endpoint: {}", e)))?
@@ -217,11 +219,11 @@ pub async fn check_for_updates(
     let updater = build_updater(&app, endpoint)?;
     match updater.check().await {
         Ok(Some(update)) => {
-            validate_update_version(env!("CARGO_PKG_VERSION"), &update.version)?;
+            validate_update_version(APP_VERSION, &update.version)?;
             info!("[updater] Update available: v{}", update.version);
             Ok(Some(UpdateInfo {
                 version: update.version.clone(),
-                current_version: env!("CARGO_PKG_VERSION").to_string(),
+                current_version: APP_VERSION.to_string(),
                 body: update.body.clone(),
                 date: update.date.map(|d| d.to_string()),
             }))
@@ -248,7 +250,7 @@ pub async fn download_and_install_update(
         .await
         .map_err(|e| AppError::Updater(format!("Update check failed: {}", e)))?
         .ok_or_else(|| AppError::Updater("No update available".to_string()))?;
-    validate_update_version(env!("CARGO_PKG_VERSION"), &update.version)?;
+    validate_update_version(APP_VERSION, &update.version)?;
     emit("downloading");
     update
         .download_and_install(

@@ -6,7 +6,7 @@
 use log::{error, info};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use typeshare::typeshare;
 
@@ -154,8 +154,7 @@ pub struct AudioInfo {
 // ============================================================================
 
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
-static POLL_CATEGORIES: LazyLock<Arc<Mutex<Vec<String>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+static POLL_CATEGORIES: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 // ============================================================================
 // Data Collection
@@ -241,6 +240,9 @@ fn collect_gpu_info() -> Option<GpuInfo> {
 
 #[cfg(target_os = "windows")]
 fn collect_display_info() -> Option<Vec<DisplayInfo>> {
+    const DISPLAY_DEVICE_ACTIVE: u32 = 1;
+    const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 4;
+
     use std::mem::{size_of, zeroed};
     use windows::core::PCWSTR;
     use windows::Win32::Graphics::Gdi::{
@@ -261,8 +263,7 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
             }
 
             // Only active displays
-            if dd.StateFlags & 1 != 0 {
-                // DISPLAY_DEVICE_ACTIVE
+            if dd.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
                 let adapter_name = PCWSTR(dd.DeviceName.as_ptr());
                 let mut dm: DEVMODEW = zeroed();
                 dm.dmSize = size_of::<DEVMODEW>() as u16;
@@ -281,7 +282,7 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
                             .to_string()
                     };
 
-                    let primary = dd.StateFlags & 4 != 0; // DISPLAY_DEVICE_PRIMARY_DEVICE
+                    let primary = dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0;
 
                     displays.push(DisplayInfo {
                         name,
