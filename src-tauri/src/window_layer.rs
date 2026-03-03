@@ -1515,14 +1515,14 @@ pub mod mouse_hook {
                             if item_idx >= 0 {
                                 select_listview_item(slv_h, item_idx);
                             }
-                            let ctx_lp = ((info_hook.pt.x as i16 as u16 as u32)
-                                | ((info_hook.pt.y as i16 as u16 as u32) << 16))
-                                as isize;
+                            // lParam = -1 → shell uses the focused item (set above)
+                            // instead of hit-testing screen coordinates (which would
+                            // see Chrome_RWHH on top and show the desktop menu).
                             let _ = PostMessageW(
                                 slv_h,
                                 WM_CONTEXTMENU,
                                 WPARAM(slv_h.0 as usize),
-                                LPARAM(ctx_lp),
+                                LPARAM(-1),
                             );
                         }
                         // Eat WM_RBUTTONUP so native handler doesn't show desktop menu
