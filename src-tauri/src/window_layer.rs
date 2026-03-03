@@ -1453,10 +1453,15 @@ pub mod mouse_hook {
                                 LPARAM(ctx_lp),
                             );
                         }
-                    } else if msg != WM_MOUSEMOVE {
+                        // Eat WM_RBUTTONUP so native handler doesn't show desktop menu
+                        return LRESULT(1);
+                    } else if msg == WM_MOUSEMOVE {
+                        // Eat mouse-move during right-click tracking
+                        return LRESULT(1);
+                    } else {
+                        // Unexpected event → cancel tracking, let it pass
                         RCLICK_ON_ICON.store(false, Ordering::Relaxed);
                     }
-                    return CallNextHookEx(hook_h, code, wparam, lparam);
                 }
 
                 // ── Left-click drag (icon repositioning with ghost image) ──
@@ -1603,16 +1608,19 @@ pub mod mouse_hook {
                             RCLICK_ON_ICON.store(true, Ordering::Relaxed);
                             let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
                             RCLICK_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
+                            log::info!(
+                                "[hook] RCLICK on icon item={} at ({},{})",
+                                item_idx, info_hook.pt.x, info_hook.pt.y
+                            );
                         }
 
-                        // Only post WM_LBUTTONDOWN to SysListView32 (for drag init).
-                        // WM_RBUTTONDOWN is NOT posted: its selection is unreliable
-                        // (ListView calls GetCursorPos → sees Chrome_RWHH).
-                        // Right-click selection is done via LVM_SETITEMSTATE on button-up.
                         if msg == WM_LBUTTONDOWN {
                             post_to_slv(slv_h, msg, &info_hook);
+                            return CallNextHookEx(hook_h, code, wparam, lparam);
                         }
-                        return CallNextHookEx(hook_h, code, wparam, lparam);
+                        // Eat WM_RBUTTONDOWN on icon — prevents native desktop menu.
+                        // Selection + WM_CONTEXTMENU handled on button-up.
+                        return LRESULT(1);
                     }
                 }
 
