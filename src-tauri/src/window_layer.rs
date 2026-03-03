@@ -126,7 +126,8 @@ pub fn restore_desktop_icons_and_unhook() {
             unhook_global(&HOOK_HANDLE_GLOBAL, "mouse hook");
             unhook_global(&KB_HOOK_HANDLE_GLOBAL, "keyboard hook");
 
-            // Free cached explorer process handle + remote buffer
+            // Unregister WTS session notification and free process cache
+            mouse_hook::unregister_session_notif();
             mouse_hook::invalidate_proc_cache_pub();
         }
     }
@@ -611,7 +612,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
         use std::time::Duration;
         use windows::Win32::UI::WindowsAndMessaging::IsWindow;
         loop {
-            std::thread::sleep(Duration::from_secs(30));
+            std::thread::sleep(Duration::from_secs(5));
             let parent_raw = WATCHDOG_PARENT.load(Ordering::SeqCst);
             if parent_raw == 0 {
                 continue;
@@ -704,7 +705,6 @@ pub mod mouse_hook {
     static DRAG_GHOST_HIML: AtomicIsize = AtomicIsize::new(0);
     // Right-click state (context menu — PostMessage doesn't trigger native WM_CONTEXTMENU)
     static RCLICK_ON_ICON: AtomicBool = AtomicBool::new(false);
-    static RCLICK_ITEM_INDEX: AtomicI32 = AtomicI32::new(-1);
     // Hover tracking — LVM_SETHOTITEM (PostMessage(WM_MOUSEMOVE) doesn't work
     // because ListView's hot-tracking checks real cursor pos via GetCursorPos)
     static CURRENT_HOT_ITEM: AtomicI32 = AtomicI32::new(-1);
@@ -754,6 +754,16 @@ pub mod mouse_hook {
         unsafe { invalidate_proc_cache() }
     }
 
+    pub fn unregister_session_notif() {
+        let dh = DISPATCH_HWND.load(Ordering::SeqCst);
+        if dh != 0 {
+            unsafe {
+                use windows::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification;
+                let _ = WTSUnRegisterSessionNotification(HWND(dh as *mut _));
+            }
+        }
+    }
+
     /// Pack two i32 screen/client coordinates into a Windows lParam isize.
     #[inline]
     fn make_lparam(x: i32, y: i32) -> isize {
@@ -781,6 +791,118 @@ pub mod mouse_hook {
     const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
     const WTS_SESSION_LOCK: u32 = 0x7;
     const WTS_SESSION_UNLOCK: u32 = 0x8;
+    const WM_DISPLAYCHANGE: u32 = 0x007E;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+
+    /// Reload double-click / drag thresholds from system settings.
+    /// Called when WM_SETTINGCHANGE fires (user changed mouse prefs in Control Panel).
+    unsafe fn refresh_mouse_metrics() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXDOUBLECLK, SM_CXDRAG, SM_CYDOUBLECLK, SM_CYDRAG,
+        };
+        DBLCLICK_TIME.store(GetDoubleClickTime(), Ordering::Relaxed);
+        DBLCLICK_CX.store(GetSystemMetrics(SM_CXDOUBLECLK) / 2, Ordering::Relaxed);
+        DBLCLICK_CY.store(GetSystemMetrics(SM_CYDOUBLECLK) / 2, Ordering::Relaxed);
+        DRAG_THRESHOLD_CX.store(GetSystemMetrics(SM_CXDRAG), Ordering::Relaxed);
+        DRAG_THRESHOLD_CY.store(GetSystemMetrics(SM_CYDRAG), Ordering::Relaxed);
+        log::info!("[settings] Mouse metrics refreshed");
+    }
+
+    /// Resize the WebView and update WebView2 controller bounds after a display change.
+    /// Called when WM_DISPLAYCHANGE fires (monitor plug/unplug or resolution change).
+    unsafe fn on_display_change() {
+        use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+        use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumChildWindows, SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER,
+        };
+
+        // Compute virtual desktop bounds across all monitors
+        struct Bounds {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+        let mut b = Bounds {
+            left: i32::MAX,
+            top: i32::MAX,
+            right: i32::MIN,
+            bottom: i32::MIN,
+        };
+        unsafe extern "system" fn mon_cb(
+            _hm: HMONITOR,
+            _hdc: HDC,
+            rect: *mut RECT,
+            lp: LPARAM,
+        ) -> BOOL {
+            if lp.0 != 0 && !rect.is_null() {
+                let r = rect.read();
+                let b = &mut *(lp.0 as *mut Bounds);
+                b.left = b.left.min(r.left);
+                b.top = b.top.min(r.top);
+                b.right = b.right.max(r.right);
+                b.bottom = b.bottom.max(r.bottom);
+            }
+            BOOL(1)
+        }
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(mon_cb),
+            LPARAM(&mut b as *mut _ as isize),
+        );
+
+        let w = b.right - b.left;
+        let h = b.bottom - b.top;
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        log::info!("[display] Display changed: virtual screen {}x{}", w, h);
+
+        // Resize WebView HWND and all its children
+        let wv = WEBVIEW_HWND.load(Ordering::Relaxed);
+        if wv != 0 {
+            let wv_h = HWND(wv as *mut _);
+            let _ = SetWindowPos(
+                wv_h,
+                HWND::default(),
+                0,
+                0,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            struct S {
+                w: i32,
+                h: i32,
+            }
+            let s = S { w, h };
+            unsafe extern "system" fn resize_child(child: HWND, lp: LPARAM) -> BOOL {
+                if lp.0 != 0 {
+                    let s = &*(lp.0 as *const S);
+                    let _ = SetWindowPos(
+                        child,
+                        HWND::default(),
+                        0,
+                        0,
+                        s.w,
+                        s.h,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                }
+                BOOL(1)
+            }
+            let _ = EnumChildWindows(wv_h, Some(resize_child), LPARAM(&s as *const _ as isize));
+        }
+
+        // Update WebView2 composition controller bounds
+        let ptr = get_comp_controller_ptr();
+        if ptr != 0 {
+            let _ = wry::set_controller_bounds_raw(ptr, w, h);
+        }
+    }
 
     unsafe extern "system" fn dispatch_wnd_proc(
         hwnd: HWND,
@@ -825,6 +947,18 @@ pub mod mouse_hook {
                 }
                 _ => {}
             }
+            return LRESULT(0);
+        }
+
+        // Monitor plug/unplug or resolution change → resize WebView to new virtual desktop
+        if msg == WM_DISPLAYCHANGE {
+            on_display_change();
+            return LRESULT(0);
+        }
+
+        // User changed mouse settings in Control Panel → refresh cached metrics
+        if msg == WM_SETTINGCHANGE {
+            refresh_mouse_metrics();
             return LRESULT(0);
         }
 
@@ -1325,8 +1459,18 @@ pub mod mouse_hook {
     pub fn start_hook_thread() {
         std::thread::spawn(|| {
             unsafe {
-                use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                use windows::Win32::System::Com::{
+                    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+                };
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                // RAII guard: CoUninitialize when the hook thread exits
+                struct ComGuard;
+                impl Drop for ComGuard {
+                    fn drop(&mut self) {
+                        unsafe { CoUninitialize() }
+                    }
+                }
+                let _com_guard = ComGuard;
 
                 // Cache process ID + double-click metrics once at hook startup
                 OUR_PID.store(std::process::id(), Ordering::Relaxed);
@@ -1456,12 +1600,12 @@ pub mod mouse_hook {
                                 LPARAM(lp),
                             );
                             let _ = PostMessageW(slv_h, WM_LBUTTONUP, WPARAM(0), LPARAM(lp));
-                            // Context menu using the now-natively-selected item
+                            // Context menu at actual cursor position
                             let _ = PostMessageW(
                                 slv_h,
                                 WM_CONTEXTMENU,
                                 WPARAM(slv_h.0 as usize),
-                                LPARAM(-1),
+                                LPARAM(make_lparam(info_hook.pt.x, info_hook.pt.y)),
                             );
                         }
                         return LRESULT(1);
@@ -1567,13 +1711,26 @@ pub mod mouse_hook {
                                 let mut cp = info_hook.pt;
                                 let _ = ScreenToClient(rwhh_hwnd, &mut cp);
                                 let lp = make_lparam(cp.x, cp.y);
-                                let wp = match msg {
-                                    WM_LBUTTONDOWN => MK_LBUTTON as usize,
-                                    WM_RBUTTONDOWN => MK_RBUTTON as usize,
-                                    WM_MBUTTONDOWN => MK_MBUTTON as usize,
-                                    _ => 0,
-                                };
-                                let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(wp), LPARAM(lp));
+                                // Include real modifier / button state so Shift+click,
+                                // Ctrl+click and drag-move work correctly in the WebView.
+                                use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                                let mut mk: usize = 0;
+                                if msg == WM_LBUTTONDOWN || GetAsyncKeyState(0x01) < 0 {
+                                    mk |= 0x0001; // MK_LBUTTON
+                                }
+                                if msg == WM_RBUTTONDOWN || GetAsyncKeyState(0x02) < 0 {
+                                    mk |= 0x0002; // MK_RBUTTON
+                                }
+                                if msg == WM_MBUTTONDOWN || GetAsyncKeyState(0x04) < 0 {
+                                    mk |= 0x0010; // MK_MBUTTON
+                                }
+                                if GetAsyncKeyState(0x10) < 0 {
+                                    mk |= 0x0004; // MK_SHIFT
+                                }
+                                if GetAsyncKeyState(0x11) < 0 {
+                                    mk |= 0x0008; // MK_CONTROL
+                                }
+                                let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(mk), LPARAM(lp));
                             }
                         }
                     }
@@ -1614,7 +1771,6 @@ pub mod mouse_hook {
                         } else {
                             // Right-click: track for context menu
                             RCLICK_ON_ICON.store(true, Ordering::Relaxed);
-                            RCLICK_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
                             log::debug!(
                                 "[hook] RCLICK on icon item={} at ({},{})",
                                 item_idx,
@@ -1694,23 +1850,28 @@ pub mod mouse_hook {
 
                 let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(kb.vkCode as usize), LPARAM(lp));
 
-                // Generate WM_CHAR for key-down events (text input)
+                // Generate WM_CHAR for key-down events (text input).
+                // Skip when Ctrl is held to avoid double-processing shortcuts (Ctrl+C etc.).
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                     use windows::Win32::UI::Input::KeyboardAndMouse::{
                         GetKeyboardState, ToUnicode,
                     };
                     let mut kb_state = [0u8; 256];
                     let _ = GetKeyboardState(&mut kb_state);
-                    let mut chars = [0u16; 4];
-                    let count = ToUnicode(kb.vkCode, kb.scanCode, Some(&kb_state), &mut chars, 0);
-                    let char_msg = if is_sys { WM_SYSCHAR } else { WM_CHAR };
-                    for i in 0..count.max(0) as usize {
-                        let _ = PostMessageW(
-                            rwhh_hwnd,
-                            char_msg,
-                            WPARAM(chars[i] as usize),
-                            LPARAM(lp),
-                        );
+                    if kb_state[0x11] & 0x80 == 0 {
+                        // Ctrl not held — generate WM_CHAR for printable input
+                        let mut chars = [0u16; 4];
+                        let count =
+                            ToUnicode(kb.vkCode, kb.scanCode, Some(&kb_state), &mut chars, 0);
+                        let char_msg = if is_sys { WM_SYSCHAR } else { WM_CHAR };
+                        for i in 0..count.max(0) as usize {
+                            let _ = PostMessageW(
+                                rwhh_hwnd,
+                                char_msg,
+                                WPARAM(chars[i] as usize),
+                                LPARAM(lp),
+                            );
+                        }
                     }
                 }
 

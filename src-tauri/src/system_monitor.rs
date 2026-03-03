@@ -240,79 +240,93 @@ fn collect_gpu_info() -> Option<GpuInfo> {
 
 #[cfg(target_os = "windows")]
 fn collect_display_info() -> Option<Vec<DisplayInfo>> {
-    const DISPLAY_DEVICE_ACTIVE: u32 = 1;
-    const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 4;
-
     use std::mem::{size_of, zeroed};
     use windows::core::PCWSTR;
-    use windows::Win32::Graphics::Gdi::{
-        EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
     };
-    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
+    // MONITORINFOEXW layout — cbSize distinguishes it from plain MONITORINFO.
+    #[repr(C)]
+    struct MonitorInfoEx {
+        size: u32,
+        monitor_rect: RECT,
+        work_rect: RECT,
+        flags: u32,
+        device_name: [u16; 32],
+    }
+
+    const MONITORINFOF_PRIMARY: u32 = 1;
+
+    struct Acc(Vec<DisplayInfo>);
+
+    unsafe extern "system" fn cb(hm: HMONITOR, _hdc: HDC, _rect: *mut RECT, lp: LPARAM) -> BOOL {
+        let acc = &mut *(lp.0 as *mut Acc);
+
+        let mut info = MonitorInfoEx {
+            size: size_of::<MonitorInfoEx>() as u32,
+            monitor_rect: zeroed(),
+            work_rect: zeroed(),
+            flags: 0,
+            device_name: [0u16; 32],
+        };
+
+        if !GetMonitorInfoW(hm, &mut info as *mut MonitorInfoEx as *mut _).as_bool() {
+            return BOOL(1);
+        }
+
+        let primary = info.flags & MONITORINFOF_PRIMARY != 0;
+        let name_len = info.device_name.iter().position(|&c| c == 0).unwrap_or(32);
+        let name = String::from_utf16_lossy(&info.device_name[..name_len]);
+
+        let mut dm: DEVMODEW = zeroed();
+        dm.dmSize = size_of::<DEVMODEW>() as u16;
+        let (width, height, refresh_rate) = if EnumDisplaySettingsW(
+            PCWSTR(info.device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut dm,
+        )
+        .as_bool()
+        {
+            let rr = (dm.dmDisplayFrequency > 0).then_some(dm.dmDisplayFrequency);
+            (dm.dmPelsWidth, dm.dmPelsHeight, rr)
+        } else {
+            let r = info.monitor_rect;
+            ((r.right - r.left) as u32, (r.bottom - r.top) as u32, None)
+        };
+
+        // Per-monitor effective DPI
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        let _ = GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+
+        acc.0.push(DisplayInfo {
+            name,
+            width,
+            height,
+            refresh_rate,
+            scale_factor: Some(dpi_x as f32 / 96.0),
+            primary,
+        });
+
+        BOOL(1)
+    }
 
     unsafe {
-        let mut displays = Vec::new();
-        let mut idx = 0u32;
-
-        loop {
-            let mut dd: DISPLAY_DEVICEW = zeroed();
-            dd.cb = size_of::<DISPLAY_DEVICEW>() as u32;
-
-            if !EnumDisplayDevicesW(PCWSTR::null(), idx, &mut dd, 0).as_bool() {
-                break;
-            }
-
-            // Only active displays
-            if dd.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
-                let adapter_name = PCWSTR(dd.DeviceName.as_ptr());
-                let mut dm: DEVMODEW = zeroed();
-                dm.dmSize = size_of::<DEVMODEW>() as u16;
-
-                if EnumDisplaySettingsW(adapter_name, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
-                    // Try getting the monitor name (second-level enumeration)
-                    let mut monitor: DISPLAY_DEVICEW = zeroed();
-                    monitor.cb = size_of::<DISPLAY_DEVICEW>() as u32;
-                    let name = if EnumDisplayDevicesW(adapter_name, 0, &mut monitor, 0).as_bool() {
-                        String::from_utf16_lossy(&monitor.DeviceString)
-                            .trim_end_matches('\0')
-                            .to_string()
-                    } else {
-                        String::from_utf16_lossy(&dd.DeviceString)
-                            .trim_end_matches('\0')
-                            .to_string()
-                    };
-
-                    let primary = dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0;
-
-                    displays.push(DisplayInfo {
-                        name,
-                        width: dm.dmPelsWidth,
-                        height: dm.dmPelsHeight,
-                        refresh_rate: if dm.dmDisplayFrequency > 0 {
-                            Some(dm.dmDisplayFrequency)
-                        } else {
-                            None
-                        },
-                        scale_factor: None, // Set below
-                        primary,
-                    });
-                }
-            }
-
-            idx += 1;
-        }
-
-        // Apply system DPI as scale factor
-        let dpi = GetDpiForSystem();
-        let scale = dpi as f32 / 96.0;
-        for d in &mut displays {
-            d.scale_factor = Some(scale);
-        }
-
-        if displays.is_empty() {
+        let mut acc = Acc(Vec::new());
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(cb),
+            LPARAM(&mut acc as *mut _ as isize),
+        );
+        if acc.0.is_empty() {
             None
         } else {
-            Some(displays)
+            Some(acc.0)
         }
     }
 }
