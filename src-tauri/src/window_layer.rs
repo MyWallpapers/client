@@ -1503,21 +1503,34 @@ pub mod mouse_hook {
                 use windows::Win32::Graphics::Gdi::ScreenToClient;
 
                 // ── Right-click on icon: context menu ──
-                // PostMessage(WM_RBUTTONDOWN) doesn't reliably select the item
-                // (ListView checks GetCursorPos, sees Chrome_RWHH). Instead:
-                // explicit LVM_SETITEMSTATE (sync) then WM_CONTEXTMENU (async).
+                // Native right-click fails because shell hit-tests via GetCursorPos
+                // and sees Chrome_RWHH. Instead: simulate a quick left-click to
+                // natively select the item, then send WM_CONTEXTMENU.
                 if RCLICK_ON_ICON.load(Ordering::Relaxed) {
                     if msg == WM_RBUTTONUP {
                         RCLICK_ON_ICON.store(false, Ordering::Relaxed);
                         if slv_raw != 0 {
                             let slv_h = HWND(slv_raw as *mut _);
-                            let item_idx = RCLICK_ITEM_INDEX.load(Ordering::Relaxed);
-                            if item_idx >= 0 {
-                                select_listview_item(slv_h, item_idx);
-                            }
-                            // lParam = -1 → shell uses the focused item (set above)
-                            // instead of hit-testing screen coordinates (which would
-                            // see Chrome_RWHH on top and show the desktop menu).
+                            // Quick left-click to natively select the icon
+                            // (LVM_SETITEMSTATE alone doesn't set all internal shell state)
+                            let mut slv_cp = info_hook.pt;
+                            let _ = ScreenToClient(slv_h, &mut slv_cp);
+                            let lp = ((slv_cp.x as i16 as u16 as u32)
+                                | ((slv_cp.y as i16 as u16 as u32) << 16))
+                                as isize;
+                            let _ = PostMessageW(
+                                slv_h,
+                                WM_LBUTTONDOWN,
+                                WPARAM(MK_LBUTTON as usize),
+                                LPARAM(lp),
+                            );
+                            let _ = PostMessageW(
+                                slv_h,
+                                WM_LBUTTONUP,
+                                WPARAM(0),
+                                LPARAM(lp),
+                            );
+                            // Context menu using the now-natively-selected item
                             let _ = PostMessageW(
                                 slv_h,
                                 WM_CONTEXTMENU,
@@ -1525,13 +1538,10 @@ pub mod mouse_hook {
                                 LPARAM(-1),
                             );
                         }
-                        // Eat WM_RBUTTONUP so native handler doesn't show desktop menu
                         return LRESULT(1);
                     } else if msg == WM_MOUSEMOVE {
-                        // Eat mouse-move during right-click tracking
                         return LRESULT(1);
                     } else {
-                        // Unexpected event → cancel tracking, let it pass
                         RCLICK_ON_ICON.store(false, Ordering::Relaxed);
                     }
                 }
