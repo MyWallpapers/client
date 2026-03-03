@@ -101,8 +101,8 @@ pub fn get_media_info() -> AppResult<MediaInfo> {
 
 /// Get the current active media session (manager → session).
 #[cfg(target_os = "windows")]
-fn current_session(
-) -> AppResult<windows::Media::Control::GlobalSystemMediaTransportControlsSession> {
+fn current_session() -> AppResult<windows::Media::Control::GlobalSystemMediaTransportControlsSession>
+{
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
 
     let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
