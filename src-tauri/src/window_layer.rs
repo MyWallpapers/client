@@ -120,6 +120,9 @@ pub fn restore_desktop_icons_and_unhook() {
                     }
                 }
             }
+
+            // Free cached explorer process handle + remote buffer
+            mouse_hook::invalidate_proc_cache_pub();
         }
     }
 }
@@ -611,6 +614,8 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
             unsafe {
                 if !IsWindow(HWND(parent_raw as *mut _)).as_bool() {
                     info!("[watchdog] Parent HWND stale, re-detecting desktop...");
+                    // Invalidate cached explorer handle (PID may have changed)
+                    mouse_hook::invalidate_proc_cache_pub();
                     match detect_desktop() {
                         Ok(d) => {
                             mouse_hook::set_target_parent_hwnd(d.target_parent.0 as isize);
@@ -707,6 +712,12 @@ pub mod mouse_hook {
         std::sync::atomic::AtomicI32::new(-1);
     static LAST_HOVER_TICK: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+    // Cached explorer process handle + remote buffer for cross-process LVM ops.
+    // Avoids OpenProcess/VirtualAllocEx/VirtualFreeEx/CloseHandle per call.
+    static CACHED_PROC_HANDLE: AtomicIsize = AtomicIsize::new(0);
+    static CACHED_PROC_PID: AtomicU32 = AtomicU32::new(0);
+    static CACHED_REMOTE_BUF: AtomicIsize = AtomicIsize::new(0);
+    const CACHED_BUF_SIZE: usize = 256; // enough for any LV struct
 
     pub const WM_MWP_SETBOUNDS_PUB: u32 = 0x8000 + 43;
     const WM_MWP_MOUSE: u32 = 0x8000 + 42;
@@ -740,6 +751,9 @@ pub mod mouse_hook {
     }
     pub fn get_chrome_rwhh_raw() -> isize {
         CHROME_RWHH.load(Ordering::SeqCst)
+    }
+    pub fn invalidate_proc_cache_pub() {
+        unsafe { invalidate_proc_cache() }
     }
 
 
@@ -962,16 +976,91 @@ pub mod mouse_hook {
         false
     }
 
-    /// Check if screen point is over a desktop icon via LVM_HITTEST.
-    /// Cross-process: allocates the LVHITTESTINFO struct in explorer.exe's
-    /// address space so SysListView32 can read the pointer from SendMessage.
-    /// Returns true if the screen point is over a desktop icon.
-    /// Thin wrapper around get_hit_item_index.
-    unsafe fn hit_test_icon(slv: HWND, screen_pt: &windows::Win32::Foundation::POINT) -> bool {
-        get_hit_item_index(slv, screen_pt) >= 0
+    /// Ensure we have a cached process handle + remote buffer for the given PID.
+    /// Returns (HANDLE, remote_ptr) or None on failure.
+    /// The cache is invalidated when PID changes (explorer restart).
+    unsafe fn ensure_cached_proc(
+        pid: u32,
+    ) -> Option<(
+        windows::Win32::Foundation::HANDLE,
+        *mut std::ffi::c_void,
+    )> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Memory::{
+            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+        };
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
+
+        let cached_pid = CACHED_PROC_PID.load(Ordering::Relaxed);
+        if cached_pid == pid && cached_pid != 0 {
+            let h = CACHED_PROC_HANDLE.load(Ordering::Relaxed);
+            let buf = CACHED_REMOTE_BUF.load(Ordering::Relaxed);
+            if h != 0 && buf != 0 {
+                return Some((
+                    windows::Win32::Foundation::HANDLE(h as *mut _),
+                    buf as *mut std::ffi::c_void,
+                ));
+            }
+        }
+
+        // Invalidate old cache
+        let old_h = CACHED_PROC_HANDLE.swap(0, Ordering::Relaxed);
+        let old_buf = CACHED_REMOTE_BUF.swap(0, Ordering::Relaxed);
+        CACHED_PROC_PID.store(0, Ordering::Relaxed);
+        if old_h != 0 {
+            let handle = windows::Win32::Foundation::HANDLE(old_h as *mut _);
+            if old_buf != 0 {
+                let _ = VirtualFreeEx(handle, old_buf as *mut _, 0, MEM_RELEASE);
+            }
+            let _ = CloseHandle(handle);
+        }
+
+        let proc = OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+            false,
+            pid,
+        )
+        .ok()?;
+
+        let remote = VirtualAllocEx(
+            proc,
+            None,
+            CACHED_BUF_SIZE,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote.is_null() {
+            let _ = CloseHandle(proc);
+            return None;
+        }
+
+        CACHED_PROC_HANDLE.store(proc.0 as isize, Ordering::Relaxed);
+        CACHED_REMOTE_BUF.store(remote as isize, Ordering::Relaxed);
+        CACHED_PROC_PID.store(pid, Ordering::Relaxed);
+
+        Some((proc, remote))
     }
 
-    /// Execute a cross-process ListView message with a remote buffer.
+    /// Invalidate the cached explorer process handle (called on explorer restart).
+    unsafe fn invalidate_proc_cache() {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Memory::{VirtualFreeEx, MEM_RELEASE};
+
+        let old_h = CACHED_PROC_HANDLE.swap(0, Ordering::Relaxed);
+        let old_buf = CACHED_REMOTE_BUF.swap(0, Ordering::Relaxed);
+        CACHED_PROC_PID.store(0, Ordering::Relaxed);
+        if old_h != 0 {
+            let handle = windows::Win32::Foundation::HANDLE(old_h as *mut _);
+            if old_buf != 0 {
+                let _ = VirtualFreeEx(handle, old_buf as *mut _, 0, MEM_RELEASE);
+            }
+            let _ = CloseHandle(handle);
+        }
+    }
+
+    /// Execute a cross-process ListView message using a cached process handle + remote buffer.
     /// Writes `input` to explorer's address space, sends the message, reads `output`.
     /// Returns the SendMessage result (0 on failure).
     unsafe fn cross_process_lvm_send<T>(
@@ -981,14 +1070,10 @@ pub mod mouse_hook {
         input: &T,
         output: &mut T,
     ) -> usize {
-        use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-        use windows::Win32::System::Memory::{
-            VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-        };
-        use windows::Win32::System::Threading::{
-            OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-        };
+
+        let size = std::mem::size_of::<T>();
+        debug_assert!(size <= CACHED_BUF_SIZE);
 
         let mut pid = 0u32;
         GetWindowThreadProcessId(slv, Some(&mut pid));
@@ -996,25 +1081,14 @@ pub mod mouse_hook {
             return 0;
         }
 
-        let proc = match OpenProcess(
-            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
-            false,
-            pid,
-        ) {
-            Ok(h) => h,
-            Err(_) => return 0,
+        let (proc, remote) = match ensure_cached_proc(pid) {
+            Some(x) => x,
+            None => return 0,
         };
 
-        let size = std::mem::size_of::<T>();
-        let remote = VirtualAllocEx(proc, None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote.is_null() {
-            let _ = CloseHandle(proc);
-            return 0;
-        }
-
         if WriteProcessMemory(proc, remote, input as *const T as _, size, None).is_err() {
-            let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-            let _ = CloseHandle(proc);
+            // Handle may be stale (explorer restarted) — invalidate and bail
+            invalidate_proc_cache();
             return 0;
         }
 
@@ -1030,8 +1104,6 @@ pub mod mouse_hook {
         );
 
         let _ = ReadProcessMemory(proc, remote, output as *mut T as _, size, None);
-        let _ = VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
-        let _ = CloseHandle(proc);
 
         result
     }
@@ -1492,7 +1564,7 @@ pub mod mouse_hook {
                                     WPARAM(item_idx as usize),
                                     LPARAM(lp),
                                 );
-                                log::info!(
+                                log::debug!(
                                     "[hook] DRAG complete: item={} to client({},{})",
                                     item_idx, drop_pt.x, drop_pt.y
                                 );
@@ -1577,50 +1649,44 @@ pub mod mouse_hook {
                 }
 
                 // ── Wallpaper mode: button-down on icon ──
+                // Single get_hit_item_index call (avoids duplicate cross-process op)
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN) && slv_raw != 0 {
-                    if hit_test_icon(HWND(slv_raw as *mut _), &info_hook.pt) {
-                        let slv_h = HWND(slv_raw as *mut _);
-
+                    let slv_h = HWND(slv_raw as *mut _);
+                    let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
+                    if item_idx >= 0 {
                         if msg == WM_LBUTTONDOWN {
                             // Left-click: initiate drag tracking
                             NATIVE_DRAG.store(true, Ordering::Relaxed);
                             DRAG_PAST_THRESHOLD.store(false, Ordering::Relaxed);
                             DRAG_START_X.store(info_hook.pt.x, Ordering::Relaxed);
                             DRAG_START_Y.store(info_hook.pt.y, Ordering::Relaxed);
-                            let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
                             DRAG_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
-                            if item_idx >= 0 {
-                                if let Some(icon_pos) = get_item_position(slv_h, item_idx) {
-                                    let mut cursor_client = info_hook.pt;
-                                    let _ = ScreenToClient(slv_h, &mut cursor_client);
-                                    DRAG_OFFSET_X.store(cursor_client.x - icon_pos.x, Ordering::Relaxed);
-                                    DRAG_OFFSET_Y.store(cursor_client.y - icon_pos.y, Ordering::Relaxed);
-                                }
+                            if let Some(icon_pos) = get_item_position(slv_h, item_idx) {
+                                let mut cursor_client = info_hook.pt;
+                                let _ = ScreenToClient(slv_h, &mut cursor_client);
+                                DRAG_OFFSET_X.store(cursor_client.x - icon_pos.x, Ordering::Relaxed);
+                                DRAG_OFFSET_Y.store(cursor_client.y - icon_pos.y, Ordering::Relaxed);
                             }
-                            log::info!(
+                            log::debug!(
                                 "[hook] NATIVE_DRAG start at ({},{}) item={} offset=({},{})",
                                 info_hook.pt.x, info_hook.pt.y, item_idx,
                                 DRAG_OFFSET_X.load(Ordering::Relaxed),
                                 DRAG_OFFSET_Y.load(Ordering::Relaxed),
                             );
+                            post_to_slv(slv_h, msg, &info_hook);
+                            return CallNextHookEx(hook_h, code, wparam, lparam);
                         } else {
-                            // Right-click: track for context menu + store item index
+                            // Right-click: track for context menu
                             RCLICK_ON_ICON.store(true, Ordering::Relaxed);
-                            let item_idx = get_hit_item_index(slv_h, &info_hook.pt);
                             RCLICK_ITEM_INDEX.store(item_idx, Ordering::Relaxed);
-                            log::info!(
+                            log::debug!(
                                 "[hook] RCLICK on icon item={} at ({},{})",
                                 item_idx, info_hook.pt.x, info_hook.pt.y
                             );
+                            // Eat WM_RBUTTONDOWN — prevents native desktop menu.
+                            // Selection + WM_CONTEXTMENU handled on button-up.
+                            return LRESULT(1);
                         }
-
-                        if msg == WM_LBUTTONDOWN {
-                            post_to_slv(slv_h, msg, &info_hook);
-                            return CallNextHookEx(hook_h, code, wparam, lparam);
-                        }
-                        // Eat WM_RBUTTONDOWN on icon — prevents native desktop menu.
-                        // Selection + WM_CONTEXTMENU handled on button-up.
-                        return LRESULT(1);
                     }
                 }
 
@@ -1631,7 +1697,7 @@ pub mod mouse_hook {
                 if msg == WM_MOUSEMOVE && slv_raw != 0 {
                     let now = windows::Win32::System::SystemInformation::GetTickCount64();
                     let last = LAST_HOVER_TICK.load(Ordering::Relaxed);
-                    if now.wrapping_sub(last) >= 30 {
+                    if now.wrapping_sub(last) >= 50 {
                         LAST_HOVER_TICK.store(now, Ordering::Relaxed);
                         let slv_h = HWND(slv_raw as *mut _);
                         let item = get_hit_item_index(slv_h, &info_hook.pt);
