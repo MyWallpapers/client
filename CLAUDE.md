@@ -95,6 +95,43 @@ Exposes system data to widgets via Tauri IPC:
 - `frontendDist` / `devUrl`: `https://dev.mywallpaper.online` (remote frontend)
 - Window: fullscreen, no decorations, transparent, skip taskbar, not focusable
 
+## Rapid Iteration (VM Build & Test)
+
+**For quick test cycles without CI — push, build on Windows VM, relaunch.**
+
+VM: `rayan@192.168.122.150` (QEMU/KVM win11), project at `C:\dev\client`
+
+```bash
+# 1. Commit & push local changes
+git add <modified-files>
+git commit -m "fix: description courte"
+git push
+
+# 2. Sync on VM (stash if needed)
+ssh rayan@192.168.122.150 'cd C:\dev\client && git stash && git pull' 2>/dev/null
+
+# 3. Kill old app FIRST (otherwise cargo can't replace the locked exe)
+ssh rayan@192.168.122.150 'powershell -Command "Stop-Process -Name mywallpaper-desktop -Force -ErrorAction SilentlyContinue"' 2>/dev/null
+sleep 2
+
+# 4. Incremental build
+ssh -o ServerAliveInterval=30 rayan@192.168.122.150 'cd C:\dev\client\src-tauri && cargo build 2>&1 | findstr /R "Finished error"' 2>/dev/null
+
+# 5. Relaunch in interactive session (schtasks /IT required for GUI apps via SSH)
+ssh rayan@192.168.122.150 'schtasks /Create /TN LaunchApp /TR "C:\dev\client\src-tauri\target\debug\mywallpaper-desktop.exe" /SC ONCE /ST 00:00 /F /RL HIGHEST /IT && schtasks /Run /TN LaunchApp && timeout /t 3 >nul && schtasks /Delete /TN LaunchApp /F' 2>/dev/null
+
+# 6. Verify + screenshot
+sleep 5
+ssh rayan@192.168.122.150 'powershell -Command "Get-Process mywallpaper-desktop | Select-Object Id, CPU, @{N=\"MemMB\";E={[math]::Round($_.WorkingSet64/1MB,1)}}"' 2>/dev/null
+virsh screenshot win11 /tmp/vm_screenshot.png
+```
+
+**Important notes:**
+- Kill app **before** build (cargo can't overwrite locked exe → "Accès refusé")
+- Use `schtasks /IT` to launch GUI apps (SSH session 0 can't spawn interactive windows)
+- Use `virsh screenshot win11` from host to capture VM display
+- Use `findstr` instead of `grep` on Windows side
+
 ## Coding Guidelines
 
 - **Error handling**: `Result<T, String>` for commands, `.expect()` only in `main.rs`

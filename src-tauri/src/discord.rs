@@ -29,8 +29,12 @@ pub fn init() {
             if client.connect().is_ok() {
                 let _ =
                     client.set_activity(build_activity("Using MyWallpaper", "Animated Wallpaper"));
-                *CLIENT.lock().unwrap() = Some(client);
-                info!("[discord] Rich Presence connected");
+                if let Ok(mut guard) = CLIENT.lock() {
+                    *guard = Some(client);
+                    info!("[discord] Rich Presence connected");
+                } else {
+                    warn!("[discord] Failed to cache Rich Presence client");
+                }
             } else {
                 warn!("[discord] Discord not running, skipping Rich Presence");
             }

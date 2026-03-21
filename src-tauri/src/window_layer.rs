@@ -23,19 +23,14 @@ static INTERFACE_MODE: AtomicBool = AtomicBool::new(false);
 // ==============================================================================
 
 #[allow(unused_variables)]
-pub fn setup_desktop_window(window: &tauri::WebviewWindow) {
+pub fn setup_desktop_window(window: &tauri::WebviewWindow) -> crate::error::AppResult<()> {
     #[cfg(target_os = "windows")]
     {
         info!("[window_layer] Starting desktop window setup phase...");
-        if let Err(e) = ensure_in_worker_w(window) {
-            error!(
-                "[window_layer] CRITICAL: Failed to setup desktop layer: {}",
-                e
-            );
-        } else {
-            info!("[window_layer] Desktop layer setup completed successfully.");
-        }
+        ensure_in_worker_w(window)?;
+        info!("[window_layer] Desktop layer setup completed successfully.");
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -613,6 +608,14 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
         use windows::Win32::UI::WindowsAndMessaging::IsWindow;
         loop {
             std::thread::sleep(Duration::from_secs(5));
+            let our_hwnd = HWND(watchdog_our as *mut _);
+            unsafe {
+                if !IsWindow(our_hwnd).as_bool() {
+                    info!("[watchdog] WebView HWND no longer exists, stopping watchdog");
+                    WATCHDOG_PARENT.store(0, Ordering::SeqCst);
+                    break;
+                }
+            }
             let parent_raw = WATCHDOG_PARENT.load(Ordering::SeqCst);
             if parent_raw == 0 {
                 continue;
@@ -630,7 +633,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
                             if !d.syslistview.is_invalid() {
                                 mouse_hook::set_syslistview_hwnd(d.syslistview.0 as isize);
                             }
-                            apply_injection(HWND(watchdog_our as *mut _), &d);
+                            apply_injection(our_hwnd, &d);
                             WATCHDOG_PARENT.store(d.target_parent.0 as isize, Ordering::SeqCst);
                             info!("[watchdog] Re-injection done");
                         }

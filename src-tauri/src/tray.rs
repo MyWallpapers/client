@@ -5,7 +5,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle,
 };
 
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -20,6 +20,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let _tray = TrayIconBuilder::new()
         .icon(icon)
         .tooltip("MyWallpaper Desktop")
+        .show_menu_on_left_click(false)
         .menu(&menu)
         .on_menu_event(move |app, event| {
             if event.id().as_ref() == "quit" {

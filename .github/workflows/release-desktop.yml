@@ -100,6 +100,7 @@ jobs:
           git add src-tauri/tauri.conf.json src-tauri/Cargo.toml package.json
           git commit -m "release: desktop v${{ steps.bump.outputs.version }}"
           git tag "${{ steps.bump.outputs.tag }}"
+          git pull --rebase origin main
           git push origin main "${{ steps.bump.outputs.tag }}"
 
   build-tauri:

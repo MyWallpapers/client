@@ -38,8 +38,17 @@ fn await_bool_op(
 ) -> AppResult<()> {
     op.map_err(|e| AppError::Media(format!("{} failed: {}", name, e)))?
         .get()
-        .map(|_| ())
         .map_err(|e| AppError::Media(format!("{} get failed: {}", name, e)))
+        .and_then(|accepted| {
+            if accepted {
+                Ok(())
+            } else {
+                Err(AppError::Media(format!(
+                    "{} was rejected by the active media session",
+                    name
+                )))
+            }
+        })
 }
 
 /// Get current media playback info from the system.

@@ -8,6 +8,9 @@ use serde::Serialize;
 use typeshare::typeshare;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_RELEASE_DOWNLOAD_PATH: &str = "/MyWallpapers/client/releases/download/";
+const GITHUB_RELEASE_LATEST_PATH: &str = "/MyWallpapers/client/releases/latest/download/";
+const OAUTH_ALLOWED_HTTPS_HOSTS: &[&str] = &["accounts.google.com", "github.com"];
 
 // ============================================================================
 // Types
@@ -48,9 +51,9 @@ fn validate_updater_endpoint(url: &str) -> AppResult<url::Url> {
             "Endpoint must be on github.com".into(),
         ));
     }
-    if !parsed
-        .path()
-        .starts_with("/MyWallpapers/client/releases/download/")
+    let path = parsed.path();
+    if !path.starts_with(GITHUB_RELEASE_DOWNLOAD_PATH)
+        && !path.starts_with(GITHUB_RELEASE_LATEST_PATH)
     {
         return Err(AppError::Validation(
             "Endpoint must point to MyWallpapers/client releases".into(),
@@ -61,6 +64,12 @@ fn validate_updater_endpoint(url: &str) -> AppResult<url::Url> {
 
 fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+}
+
+fn is_allowed_oauth_https_host(host: &str) -> bool {
+    host == "mywallpaper.online"
+        || host.ends_with(".mywallpaper.online")
+        || OAUTH_ALLOWED_HTTPS_HOSTS.contains(&host)
 }
 
 pub fn validate_oauth_url(url_str: &str) -> AppResult<()> {
@@ -84,6 +93,13 @@ pub fn validate_oauth_url(url_str: &str) -> AppResult<()> {
         }
     }
     match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            if !is_allowed_oauth_https_host(host) {
+                return Err(AppError::Validation(
+                    "URL host is not allowed for desktop OAuth".into(),
+                ));
+            }
+        }
         Some(url::Host::Ipv4(ip)) => {
             if is_private_ipv4(ip) {
                 return Err(AppError::Validation(
