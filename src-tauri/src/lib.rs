@@ -113,6 +113,19 @@ fn start_with_tauri_webview() {
             match payload.event() {
                 PageLoadEvent::Started => {
                     let _ = webview.eval(&*MW_INIT_SCRIPT);
+                    // Debug: capture errors from the very start
+                    let _ = webview.eval(r#"
+                        window.__MW_ERRORS = [];
+                        window.onerror = function(m,u,l){ window.__MW_ERRORS.push('ERR:'+m+' @'+u+':'+l); };
+                        window.addEventListener('unhandledrejection', function(e){
+                            window.__MW_ERRORS.push('REJECT:'+(e.reason&&e.reason.message||e.reason||'?'));
+                        });
+                        setInterval(function(){
+                            if(window.__MW_ERRORS.length > 0) {
+                                try{localStorage.setItem('__mw_diag', JSON.stringify(window.__MW_ERRORS))}catch(e){}
+                            }
+                        }, 3000);
+                    "#);
                 }
                 PageLoadEvent::Finished => {
                     // Debug: write JS state to a file for SSH diagnostics
