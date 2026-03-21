@@ -115,21 +115,9 @@ fn start_with_tauri_webview() {
                     let _ = webview.eval(&*MW_INIT_SCRIPT);
                 }
                 PageLoadEvent::Finished => {
-                    // Debug: log any JS errors to the Rust log
-                    let _ = webview.eval(
-                        r#"
-                    window.onerror = function(msg, url, line, col, error) {
-                        fetch('https://dev.mywallpaper.online/api/health').catch(function(){});
-                        document.title = 'ERR: ' + msg + ' at ' + url + ':' + line;
-                    };
-                    window.addEventListener('unhandledrejection', function(e) {
-                        document.title = 'REJECT: ' + (e.reason?.message || e.reason || 'unknown');
-                    });
-                    setTimeout(function() {
-                        document.title = 'LOADED:' + document.readyState + ':' + (typeof window.__TAURI__) + ':' + document.querySelectorAll('script').length + 'scripts';
-                    }, 5000);
-                    "#,
-                    );
+                    // Debug: open devtools in debug builds
+                    #[cfg(debug_assertions)]
+                    webview.open_devtools();
                     // Heartbeat: frontend pings every 5s so backend can detect unresponsive WebView
                     let _ = webview.eval(
                         r#"
