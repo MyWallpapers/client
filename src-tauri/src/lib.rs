@@ -115,9 +115,31 @@ fn start_with_tauri_webview() {
                     let _ = webview.eval(&*MW_INIT_SCRIPT);
                 }
                 PageLoadEvent::Finished => {
-                    // Debug: open devtools in debug builds
-                    #[cfg(debug_assertions)]
-                    webview.open_devtools();
+                    // Debug: write JS state to a file for SSH diagnostics
+                    let _ = webview.eval(
+                        r#"
+                    (function(){
+                        var d = [];
+                        window.onerror = function(m,u,l){ d.push('ERR:'+m+' @'+u+':'+l); };
+                        window.addEventListener('unhandledrejection', function(e){
+                            d.push('REJECT:'+(e.reason&&e.reason.message||e.reason||'?'));
+                        });
+                        setTimeout(function(){
+                            d.push('ready='+document.readyState);
+                            d.push('tauri='+(typeof window.__TAURI__));
+                            d.push('init='+JSON.stringify(window.__MW_INIT__||null));
+                            d.push('scripts='+document.querySelectorAll('script').length);
+                            d.push('root='+((document.getElementById('root')||{}).innerHTML||'').substring(0,300));
+                            d.push('errs='+d.filter(function(x){return x.startsWith('ERR')||x.startsWith('REJECT')}).length);
+                            var x=new XMLHttpRequest();
+                            x.open('POST','http://localhost:19999/diag',true);
+                            x.send(d.join('\n'));
+                            // Also store in localStorage
+                            try{localStorage.setItem('__mw_diag',d.join('\n'))}catch(e){}
+                        }, 10000);
+                    })();
+                    "#,
+                    );
                     // Heartbeat: frontend pings every 5s so backend can detect unresponsive WebView
                     let _ = webview.eval(
                         r#"
