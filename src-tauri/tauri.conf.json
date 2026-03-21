@@ -34,7 +34,7 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self' https://dev.mywallpaper.online https://app.mywallpaper.online https://api.mywallpaper.online; img-src 'self' data: blob: https: http://localhost:*; media-src 'self' data: blob: https: http://localhost:*; script-src 'self' 'unsafe-inline' https://dev.mywallpaper.online https://app.mywallpaper.online https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://dev.mywallpaper.online https://app.mywallpaper.online; connect-src 'self' ipc: http://ipc.localhost https://dev.mywallpaper.online https://app.mywallpaper.online https://api.mywallpaper.online https://api.github.com https://cdn.mywallpaper.online wss://dev.mywallpaper.online wss://app.mywallpaper.online; font-src 'self' blob: https://cdn.mywallpaper.online; frame-src 'self' https://*.mywallpaper.online;"
+      "csp": null
     },
     "windows": [
       {
