@@ -226,6 +226,8 @@ fn start_with_tauri_webview() {
 
     app.run(|_app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            system_monitor::stop_monitor();
+            discord::shutdown();
             window_layer::restore_desktop_icons_and_unhook();
         }
     });

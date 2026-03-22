@@ -16,14 +16,34 @@ pub struct MediaInfo {
     pub source_app: Option<String>,
 }
 
+/// Cached WinRT media manager — created once, reused across calls.
+/// WinRT COM objects are thread-safe (MTA) so this is safe to share.
+#[cfg(target_os = "windows")]
+static MEDIA_MANAGER: std::sync::Mutex<
+    Option<windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager>,
+> = std::sync::Mutex::new(None);
+
 #[cfg(target_os = "windows")]
 fn get_manager(
 ) -> AppResult<windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager> {
     use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
-    GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+
+    if let Ok(guard) = MEDIA_MANAGER.lock() {
+        if let Some(ref mgr) = *guard {
+            return Ok(mgr.clone());
+        }
+    }
+
+    let mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .map_err(|e| AppError::Media(format!("RequestAsync failed: {}", e)))?
         .get()
-        .map_err(|e| AppError::Media(format!("Manager get failed: {}", e)))
+        .map_err(|e| AppError::Media(format!("Manager get failed: {}", e)))?;
+
+    if let Ok(mut guard) = MEDIA_MANAGER.lock() {
+        *guard = Some(mgr.clone());
+    }
+
+    Ok(mgr)
 }
 
 #[cfg(target_os = "windows")]

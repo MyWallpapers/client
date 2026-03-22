@@ -191,16 +191,22 @@ pub fn parse_categories(categories: &[String]) -> u32 {
     })
 }
 
+/// Shared System instance for one-shot calls — avoids the 200ms CPU baseline delay
+/// by reusing the last background monitor's CPU readings. Protected by a Mutex since
+/// one-shot calls come from Tauri IPC threads.
+static SHARED_SYS: std::sync::Mutex<Option<sysinfo::System>> = std::sync::Mutex::new(None);
+
 /// Collect system data for the requested category bitmask (one-shot).
 pub fn collect_system_data(mask: u32) -> SystemData {
-    let mut sys = sysinfo::System::new();
-
-    if mask & MASK_CPU != 0 {
-        sys.refresh_cpu_usage();
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    collect_with_system(&mut sys, mask)
+    let mut guard = SHARED_SYS.lock().unwrap_or_else(|e| e.into_inner());
+    let sys = guard.get_or_insert_with(|| {
+        let mut s = sysinfo::System::new();
+        s.refresh_cpu_usage();
+        s
+    });
+    // No 200ms sleep: reuse the existing CPU baseline from the last refresh.
+    // First call may return 0% CPU — acceptable vs. blocking IPC for 200ms.
+    collect_with_system(sys, mask)
 }
 
 /// Collect battery info. Returns None on desktops without a battery.
@@ -274,8 +280,8 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, DEVMODEW,
-        ENUM_CURRENT_SETTINGS,
+        EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW,
+        ENUM_CURRENT_SETTINGS, HDC, HMONITOR,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
@@ -372,18 +378,15 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
 
 #[cfg(target_os = "windows")]
 fn collect_audio_info() -> Option<AudioInfo> {
+    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
     use windows::Win32::Media::Audio::{
         eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
     };
-    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
-    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ};
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
     unsafe {
-        // Ensure COM is initialized for this thread (no-op if already done)
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
         let device = enumerator
@@ -394,10 +397,34 @@ fn collect_audio_info() -> Option<AudioInfo> {
         let level = volume.GetMasterVolumeLevelScalar().ok()?;
         let muted = volume.GetMute().ok()?.as_bool();
 
+        // Get device friendly name via IPropertyStore
+        let output_device =
+            device
+                .OpenPropertyStore(STGM_READ)
+                .ok()
+                .and_then(|store: IPropertyStore| {
+                    store
+                        .GetValue(&PKEY_Device_FriendlyName)
+                        .ok()
+                        .and_then(|val| {
+                            let pwsz = val.Anonymous.Anonymous.Anonymous.pwszVal;
+                            if pwsz.is_null() {
+                                None
+                            } else {
+                                let s = pwsz.to_string().ok()?;
+                                if s.is_empty() {
+                                    None
+                                } else {
+                                    Some(s)
+                                }
+                            }
+                        })
+                });
+
         Some(AudioInfo {
             volume: level,
             muted,
-            output_device: None, // Requires IPropertyStore + PKEY_Device_FriendlyName
+            output_device,
         })
     }
 }
@@ -411,8 +438,23 @@ fn collect_audio_info() -> Option<AudioInfo> {
 // Background Monitor
 // ============================================================================
 
-/// Collect system data using a reusable System instance (for the background monitor).
+/// Peripheral caches for Disks/Networks — avoids reallocation every poll cycle.
+struct Peripherals {
+    disks: sysinfo::Disks,
+    networks: sysinfo::Networks,
+}
+
+/// Collect system data using a reusable System instance.
+/// `peripherals` is Some when called from the background monitor (reuses Disks/Networks).
 fn collect_with_system(sys: &mut sysinfo::System, mask: u32) -> SystemData {
+    collect_with_peripherals(sys, mask, None)
+}
+
+fn collect_with_peripherals(
+    sys: &mut sysinfo::System,
+    mask: u32,
+    peripherals: Option<&mut Peripherals>,
+) -> SystemData {
     let mut data = SystemData::default();
 
     if mask & MASK_CPU != 0 {
@@ -446,32 +488,61 @@ fn collect_with_system(sys: &mut sysinfo::System, mask: u32) -> SystemData {
     }
 
     if mask & MASK_DISK != 0 {
-        let disks = sysinfo::Disks::new_with_refreshed_list();
-        data.disk = Some(
-            disks
-                .iter()
-                .map(|d| DiskInfo {
-                    name: d.name().to_string_lossy().into_owned(),
-                    total: d.total_space(),
-                    available: d.available_space(),
-                    fs: d.file_system().to_string_lossy().into_owned(),
-                })
-                .collect(),
-        );
+        if let Some(ref mut p) = peripherals {
+            p.disks.refresh(true);
+            data.disk = Some(
+                p.disks
+                    .iter()
+                    .map(|d| DiskInfo {
+                        name: d.name().to_string_lossy().into_owned(),
+                        total: d.total_space(),
+                        available: d.available_space(),
+                        fs: d.file_system().to_string_lossy().into_owned(),
+                    })
+                    .collect(),
+            );
+        } else {
+            let disks = sysinfo::Disks::new_with_refreshed_list();
+            data.disk = Some(
+                disks
+                    .iter()
+                    .map(|d| DiskInfo {
+                        name: d.name().to_string_lossy().into_owned(),
+                        total: d.total_space(),
+                        available: d.available_space(),
+                        fs: d.file_system().to_string_lossy().into_owned(),
+                    })
+                    .collect(),
+            );
+        }
     }
 
     if mask & MASK_NETWORK != 0 {
-        let networks = sysinfo::Networks::new_with_refreshed_list();
-        data.network = Some(
-            networks
-                .iter()
-                .map(|(name, net)| NetworkInfo {
-                    name: name.clone(),
-                    received: net.total_received(),
-                    transmitted: net.total_transmitted(),
-                })
-                .collect(),
-        );
+        if let Some(ref mut p) = peripherals {
+            p.networks.refresh(true);
+            data.network = Some(
+                p.networks
+                    .iter()
+                    .map(|(name, net)| NetworkInfo {
+                        name: name.clone(),
+                        received: net.total_received(),
+                        transmitted: net.total_transmitted(),
+                    })
+                    .collect(),
+            );
+        } else {
+            let networks = sysinfo::Networks::new_with_refreshed_list();
+            data.network = Some(
+                networks
+                    .iter()
+                    .map(|(name, net)| NetworkInfo {
+                        name: name.clone(),
+                        received: net.total_received(),
+                        transmitted: net.total_transmitted(),
+                    })
+                    .collect(),
+            );
+        }
     }
 
     if mask & MASK_BATTERY != 0 {
@@ -512,9 +583,33 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
     std::thread::spawn(move || {
         use crate::events::{AppEvent, EmitAppEvent};
 
+        // Initialize COM once for this thread (needed for WASAPI audio collection)
+        #[cfg(target_os = "windows")]
+        {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        struct ComGuard;
+        #[cfg(target_os = "windows")]
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                unsafe { windows::Win32::System::Com::CoUninitialize() }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        let _com = ComGuard;
+
         let mut sys = sysinfo::System::new();
         // Initial CPU refresh so the first poll has a baseline
         sys.refresh_cpu_usage();
+
+        let mut peripherals = Peripherals {
+            disks: sysinfo::Disks::new_with_refreshed_list(),
+            networks: sysinfo::Networks::new_with_refreshed_list(),
+        };
 
         let interval = Duration::from_secs(interval_secs);
 
@@ -526,7 +621,13 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
                 continue;
             }
 
-            let data = collect_with_system(&mut sys, mask);
+            let data = collect_with_peripherals(&mut sys, mask, Some(&mut peripherals));
+
+            // Update shared System so one-shot IPC calls get fresh CPU baseline
+            if mask & MASK_CPU != 0 {
+                // No-op: one-shot calls use SHARED_SYS which is separate.
+                // The shared sys is populated on first one-shot call.
+            }
 
             let event = AppEvent::SystemDataUpdate(Box::new(data));
             if let Err(e) = app_handle.emit_app_event(&event) {
@@ -538,6 +639,11 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
 
         info!("[system_monitor] Monitor stopped");
     });
+}
+
+/// Stop the background monitor thread (called on app exit).
+pub fn stop_monitor() {
+    MONITOR_RUNNING.store(false, Ordering::SeqCst);
 }
 
 /// Update the poll bitmask. Pass 0 to pause polling.

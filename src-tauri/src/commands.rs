@@ -5,9 +5,19 @@ use crate::events::{AppEvent, EmitAppEvent};
 use crate::system_monitor;
 use log::info;
 use serde::Serialize;
+use std::sync::LazyLock;
 use typeshare::typeshare;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Cached system info — OS details never change during app lifetime.
+static CACHED_SYSTEM_INFO: LazyLock<SystemInfo> = LazyLock::new(|| SystemInfo {
+    os: std::env::consts::OS.to_string(),
+    os_version: os_info::get().version().to_string(),
+    arch: std::env::consts::ARCH.to_string(),
+    app_version: APP_VERSION.to_string(),
+    tauri_version: tauri::VERSION.to_string(),
+});
 const GITHUB_RELEASE_DOWNLOAD_PATH: &str = "/MyWallpapers/client/releases/download/";
 const GITHUB_RELEASE_LATEST_PATH: &str = "/MyWallpapers/client/releases/latest/download/";
 const OAUTH_ALLOWED_HTTPS_HOSTS: &[&str] = &["accounts.google.com", "github.com"];
@@ -17,7 +27,7 @@ const OAUTH_ALLOWED_HTTPS_HOSTS: &[&str] = &["accounts.google.com", "github.com"
 // ============================================================================
 
 #[typeshare]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SystemInfo {
     pub os: String,
     pub os_version: String,
@@ -178,13 +188,7 @@ pub fn validate_deep_link(raw: &str) -> Option<String> {
 
 #[tauri::command]
 pub fn get_system_info() -> SystemInfo {
-    SystemInfo {
-        os: std::env::consts::OS.to_string(),
-        os_version: os_info::get().version().to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        app_version: APP_VERSION.to_string(),
-        tauri_version: tauri::VERSION.to_string(),
-    }
+    CACHED_SYSTEM_INFO.clone()
 }
 
 #[tauri::command]
@@ -273,7 +277,7 @@ pub fn restart_app(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
-pub async fn open_oauth_in_browser(app: tauri::AppHandle, url: String) -> AppResult<()> {
+pub fn open_oauth_in_browser(app: tauri::AppHandle, url: String) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
     validate_oauth_url(&url)?;
     app.opener()
@@ -310,4 +314,199 @@ pub fn media_prev() -> AppResult<()> {
 #[tauri::command]
 pub fn update_discord_presence(details: String, state: String) -> AppResult<()> {
     crate::discord::update_presence(&details, &state)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- parse_semver --
+
+    #[test]
+    fn parse_semver_basic() {
+        assert_eq!(parse_semver("1.2.3").unwrap(), (1, 2, 3));
+    }
+
+    #[test]
+    fn parse_semver_with_v_prefix() {
+        assert_eq!(parse_semver("v1.0.250").unwrap(), (1, 0, 250));
+    }
+
+    #[test]
+    fn parse_semver_strips_prerelease() {
+        assert_eq!(parse_semver("v1.0.250-dev").unwrap(), (1, 0, 250));
+        assert_eq!(parse_semver("2.1.0-beta.1").unwrap(), (2, 1, 0));
+    }
+
+    #[test]
+    fn parse_semver_rejects_short() {
+        assert!(parse_semver("1.2").is_err());
+        assert!(parse_semver("1").is_err());
+    }
+
+    #[test]
+    fn parse_semver_rejects_non_numeric() {
+        assert!(parse_semver("a.b.c").is_err());
+        assert!(parse_semver("1.2.x").is_err());
+    }
+
+    // -- validate_update_version --
+
+    #[test]
+    fn validate_update_allows_upgrade() {
+        assert!(validate_update_version("1.0.0", "1.0.1").is_ok());
+        assert!(validate_update_version("1.0.0", "2.0.0").is_ok());
+    }
+
+    #[test]
+    fn validate_update_allows_same_version() {
+        assert!(validate_update_version("1.0.250", "1.0.250").is_ok());
+    }
+
+    #[test]
+    fn validate_update_rejects_downgrade() {
+        assert!(validate_update_version("1.0.250", "1.0.249").is_err());
+        assert!(validate_update_version("2.0.0", "1.9.99").is_err());
+    }
+
+    // -- validate_oauth_url --
+
+    #[test]
+    fn oauth_allows_mywallpaper_https() {
+        assert!(validate_oauth_url("https://mywallpaper.online/callback").is_ok());
+        assert!(validate_oauth_url("https://app.mywallpaper.online/auth").is_ok());
+    }
+
+    #[test]
+    fn oauth_allows_allowed_hosts() {
+        assert!(validate_oauth_url("https://accounts.google.com/o/oauth2").is_ok());
+        assert!(validate_oauth_url("https://github.com/login/oauth").is_ok());
+    }
+
+    #[test]
+    fn oauth_allows_localhost_http() {
+        assert!(validate_oauth_url("http://localhost:3000/callback").is_ok());
+        assert!(validate_oauth_url("http://127.0.0.1:8080/auth").is_ok());
+        assert!(validate_oauth_url("http://[::1]:3000/auth").is_ok());
+    }
+
+    #[test]
+    fn oauth_rejects_http_non_localhost() {
+        assert!(validate_oauth_url("http://evil.com/steal").is_err());
+    }
+
+    #[test]
+    fn oauth_rejects_unknown_https_host() {
+        assert!(validate_oauth_url("https://evil.com/phish").is_err());
+    }
+
+    #[test]
+    fn oauth_rejects_private_ips() {
+        assert!(validate_oauth_url("https://192.168.1.1/admin").is_err());
+        assert!(validate_oauth_url("https://10.0.0.1/admin").is_err());
+        assert!(validate_oauth_url("https://127.0.0.1/admin").is_err());
+    }
+
+    #[test]
+    fn oauth_rejects_ipv6_private() {
+        assert!(validate_oauth_url("https://[::1]/admin").is_err());
+        assert!(validate_oauth_url("https://[fe80::1]/admin").is_err());
+        assert!(validate_oauth_url("https://[fd12::1]/admin").is_err());
+    }
+
+    #[test]
+    fn oauth_rejects_bad_schemes() {
+        assert!(validate_oauth_url("ftp://mywallpaper.online/file").is_err());
+        assert!(validate_oauth_url("javascript:alert(1)").is_err());
+    }
+
+    // -- validate_updater_endpoint --
+
+    #[test]
+    fn updater_allows_valid_release_url() {
+        assert!(validate_updater_endpoint(
+            "https://github.com/MyWallpapers/client/releases/latest/download/latest.json"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn updater_allows_download_path() {
+        assert!(validate_updater_endpoint(
+            "https://github.com/MyWallpapers/client/releases/download/v1.0.0/latest.json"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn updater_rejects_non_https() {
+        assert!(validate_updater_endpoint(
+            "http://github.com/MyWallpapers/client/releases/latest/download/latest.json"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn updater_rejects_non_github() {
+        assert!(validate_updater_endpoint("https://evil.com/latest.json").is_err());
+    }
+
+    #[test]
+    fn updater_rejects_wrong_path() {
+        assert!(validate_updater_endpoint(
+            "https://github.com/other/repo/releases/latest/download/latest.json"
+        )
+        .is_err());
+    }
+
+    // -- validate_deep_link --
+
+    #[test]
+    fn deep_link_valid() {
+        assert!(validate_deep_link("mywallpaper://callback?code=abc").is_some());
+        assert!(validate_deep_link("mywallpaper://auth/token").is_some());
+        assert!(validate_deep_link("mywallpaper://oauth").is_some());
+        assert!(validate_deep_link("mywallpaper://login").is_some());
+        assert!(validate_deep_link("mywallpaper://app").is_some());
+    }
+
+    #[test]
+    fn deep_link_rejects_unknown_action() {
+        assert!(validate_deep_link("mywallpaper://evil").is_none());
+        assert!(validate_deep_link("mywallpaper://exec/cmd").is_none());
+    }
+
+    #[test]
+    fn deep_link_rejects_wrong_scheme() {
+        assert!(validate_deep_link("https://mywallpaper.online").is_none());
+        assert!(validate_deep_link("not-a-url").is_none());
+    }
+
+    // -- parse_categories --
+
+    #[test]
+    fn parse_categories_basic() {
+        use crate::system_monitor::*;
+        let cats: Vec<String> = vec!["cpu".into(), "memory".into(), "uptime".into()];
+        let mask = parse_categories(&cats);
+        assert_eq!(mask, MASK_CPU | MASK_MEMORY | MASK_UPTIME);
+    }
+
+    #[test]
+    fn parse_categories_unknown_ignored() {
+        use crate::system_monitor::*;
+        let cats: Vec<String> = vec!["cpu".into(), "unknown".into()];
+        assert_eq!(parse_categories(&cats), MASK_CPU);
+    }
+
+    #[test]
+    fn parse_categories_empty() {
+        use crate::system_monitor::*;
+        let cats: Vec<String> = vec![];
+        assert_eq!(parse_categories(&cats), 0);
+    }
 }

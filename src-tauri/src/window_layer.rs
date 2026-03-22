@@ -444,7 +444,13 @@ fn apply_injection(our_hwnd: windows::Win32::Foundation::HWND, detection: &Deskt
 
         // 5. Reparent into WorkerW (SW_SHOWNA preserves Z-order)
         let _ = ShowWindow(detection.target_parent, SW_SHOWNA);
-        let _ = SetParent(our_hwnd, detection.target_parent);
+        if SetParent(our_hwnd, detection.target_parent).is_err() {
+            error!(
+                "[apply_injection] SetParent failed for HWND 0x{:X} → parent 0x{:X}",
+                our_hwnd.0 as isize, detection.target_parent.0 as isize
+            );
+            return;
+        }
 
         // 6. Size to full monitor + force frame recalc
         let _ = SetWindowPos(
@@ -666,6 +672,8 @@ pub mod mouse_hook {
     const MOUSE_MUP: i32 = 0x0208;
     const MOUSE_WHEEL: i32 = 0x020A;
     const MOUSE_HWHEEL: i32 = 0x020E;
+    const MOUSE_XDOWN: i32 = 0x020B;
+    const MOUSE_XUP: i32 = 0x020C;
     const MK_NONE: i32 = 0x0;
     const MK_LBUTTON: i32 = 0x0001;
     const MK_RBUTTON: i32 = 0x0002;
@@ -711,7 +719,7 @@ pub mod mouse_hook {
     // Hover tracking — LVM_SETHOTITEM (PostMessage(WM_MOUSEMOVE) doesn't work
     // because ListView's hot-tracking checks real cursor pos via GetCursorPos)
     static CURRENT_HOT_ITEM: AtomicI32 = AtomicI32::new(-1);
-    static LAST_HOVER_TICK: AtomicU64 = AtomicU64::new(0);
+    static LAST_HOVER_TICK: AtomicU32 = AtomicU32::new(0);
     // Cached explorer process handle + remote buffer for cross-process LVM ops.
     // Avoids OpenProcess/VirtualAllocEx/VirtualFreeEx/CloseHandle per call.
     static CACHED_PROC_HANDLE: AtomicIsize = AtomicIsize::new(0);
@@ -724,34 +732,34 @@ pub mod mouse_hook {
     const WM_MWP_MOUSE: u32 = WM_APP + 42;
 
     pub fn set_webview_hwnd(h: isize) {
-        WEBVIEW_HWND.store(h, Ordering::SeqCst);
+        WEBVIEW_HWND.store(h, Ordering::Release);
     }
     pub fn set_syslistview_hwnd(h: isize) {
-        SYSLISTVIEW_HWND.store(h, Ordering::SeqCst);
+        SYSLISTVIEW_HWND.store(h, Ordering::Release);
     }
     pub fn set_target_parent_hwnd(h: isize) {
-        TARGET_PARENT_HWND.store(h, Ordering::SeqCst);
+        TARGET_PARENT_HWND.store(h, Ordering::Release);
     }
     pub fn set_progman_hwnd(h: isize) {
-        PROGMAN_HWND.store(h, Ordering::SeqCst);
+        PROGMAN_HWND.store(h, Ordering::Release);
     }
     pub fn set_explorer_pid(pid: u32) {
-        EXPLORER_PID.store(pid, Ordering::SeqCst);
+        EXPLORER_PID.store(pid, Ordering::Release);
     }
     pub fn get_syslistview_hwnd() -> isize {
-        SYSLISTVIEW_HWND.load(Ordering::SeqCst)
+        SYSLISTVIEW_HWND.load(Ordering::Acquire)
     }
     pub fn set_comp_controller_ptr(p: isize) {
-        COMP_CONTROLLER_PTR.store(p, Ordering::SeqCst);
+        COMP_CONTROLLER_PTR.store(p, Ordering::Release);
     }
     pub fn get_comp_controller_ptr() -> isize {
-        COMP_CONTROLLER_PTR.load(Ordering::SeqCst)
+        COMP_CONTROLLER_PTR.load(Ordering::Acquire)
     }
     pub fn get_dispatch_hwnd() -> isize {
-        DISPATCH_HWND.load(Ordering::SeqCst)
+        DISPATCH_HWND.load(Ordering::Acquire)
     }
     pub fn get_chrome_rwhh_raw() -> isize {
-        CHROME_RWHH.load(Ordering::SeqCst)
+        CHROME_RWHH.load(Ordering::Acquire)
     }
     pub fn invalidate_proc_cache_pub() {
         unsafe { invalidate_proc_cache() }
@@ -959,8 +967,13 @@ pub mod mouse_hook {
             return LRESULT(0);
         }
 
-        // User changed mouse settings in Control Panel → refresh cached metrics
+        // User changed system settings — only refresh mouse metrics if relevant.
+        // lp points to the setting area string (e.g. "Environment", "Policy", etc.)
+        // or is 0/SPI_* for SystemParametersInfo changes.
         if msg == WM_SETTINGCHANGE {
+            // Always refresh on SPI notifications (wp contains the SPI_ constant)
+            // and on general setting changes where lp is null or unknown.
+            // This is cheap enough to run on any WM_SETTINGCHANGE (~4 syscalls).
             refresh_mouse_metrics();
             return LRESULT(0);
         }
@@ -977,6 +990,8 @@ pub mod mouse_hook {
                 ..Default::default()
             };
             let _ = RegisterClassW(&wc);
+            // Hidden top-level window (not HWND_MESSAGE) so WTSRegisterSessionNotification
+            // and WM_DISPLAYCHANGE/WM_SETTINGCHANGE work reliably per MSDN requirements.
             if let Ok(h) = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 cls,
@@ -986,12 +1001,12 @@ pub mod mouse_hook {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                None, // top-level (not HWND_MESSAGE)
                 None,
                 None,
                 None,
             ) {
-                DISPATCH_HWND.store(h.0 as isize, Ordering::SeqCst);
+                DISPATCH_HWND.store(h.0 as isize, Ordering::Release);
 
                 // Register for session lock/unlock notifications
                 use windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
@@ -1001,7 +1016,6 @@ pub mod mouse_hook {
         }
     }
 
-    #[inline]
     unsafe fn get_parent_process_id(pid: u32) -> Option<u32> {
         use windows::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -1455,6 +1469,14 @@ pub mod mouse_hook {
                     cy,
                 );
             }
+            WM_XBUTTONDOWN => {
+                let xbutton = (info_hook.mouseData >> 16) as u32;
+                post_mouse(MOUSE_XDOWN, MK_NONE, xbutton, cx, cy);
+            }
+            WM_XBUTTONUP => {
+                let xbutton = (info_hook.mouseData >> 16) as u32;
+                post_mouse(MOUSE_XUP, MK_NONE, xbutton, cx, cy);
+            }
             _ => {}
         }
     }
@@ -1710,6 +1732,14 @@ pub mod mouse_hook {
                                 let wp = (delta as usize) << 16;
                                 let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(wp), LPARAM(lp));
                             }
+                            WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                                let mut cp = info_hook.pt;
+                                let _ = ScreenToClient(rwhh_hwnd, &mut cp);
+                                let lp = make_lparam(cp.x, cp.y);
+                                let xbutton = (info_hook.mouseData >> 16) as u16;
+                                let wp = (xbutton as usize) << 16;
+                                let _ = PostMessageW(rwhh_hwnd, msg, WPARAM(wp), LPARAM(lp));
+                            }
                             _ => {
                                 let mut cp = info_hook.pt;
                                 let _ = ScreenToClient(rwhh_hwnd, &mut cp);
@@ -1790,7 +1820,8 @@ pub mod mouse_hook {
                 // Hover highlight: cross-process LVM_HITTEST → PostMessage LVM_SETHOTITEM (50ms throttle).
                 // PostMessage(WM_MOUSEMOVE) fails because ListView hot-tracking calls GetCursorPos.
                 if msg == WM_MOUSEMOVE && slv_raw != 0 {
-                    let now = windows::Win32::System::SystemInformation::GetTickCount64();
+                    // Use info_hook.time (already in MSLLHOOKSTRUCT) instead of GetTickCount64() syscall
+                    let now = info_hook.time;
                     let last = LAST_HOVER_TICK.load(Ordering::Relaxed);
                     if now.wrapping_sub(last) >= 50 {
                         LAST_HOVER_TICK.store(now, Ordering::Relaxed);
@@ -1881,21 +1912,120 @@ pub mod mouse_hook {
                 CallNextHookEx(hook_h, code, wparam, lparam)
             }
 
+            unsafe fn install_hooks() {
+                match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
+                    Ok(h) => {
+                        crate::window_layer::HOOK_HANDLE_GLOBAL
+                            .store(h.0 as isize, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        log::error!("[hook] Failed to install mouse hook: {:?}", e);
+                    }
+                }
+                match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
+                    Ok(h) => {
+                        crate::window_layer::KB_HOOK_HANDLE_GLOBAL
+                            .store(h.0 as isize, Ordering::SeqCst);
+                    }
+                    Err(e) => {
+                        log::error!("[hook] Failed to install keyboard hook: {:?}", e);
+                    }
+                }
+            }
+
+            /// Re-install hooks if Windows removed them (LL hook timeout).
+            /// Uses a timer to periodically verify hooks are still active.
+            const HOOK_HEALTH_TIMER_ID: usize = 0xDEAD_F00D;
+            const HOOK_HEALTH_INTERVAL_MS: u32 = 10_000; // 10s
+
+            unsafe fn check_hook_health() {
+                let mh = crate::window_layer::HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
+                let kh = crate::window_layer::KB_HOOK_HANDLE_GLOBAL.load(Ordering::SeqCst);
+                // If both are 0, hooks were never installed or intentionally removed
+                if mh == 0 && kh == 0 {
+                    return;
+                }
+                // Try a no-op CallNextHookEx — if the hook was removed by Windows,
+                // re-install. We detect removal by checking if the handle is still valid.
+                // Simplest heuristic: just re-install periodically (idempotent if still active).
+                if mh != 0 {
+                    // UnhookWindowsHookEx + re-install to ensure freshness
+                    let _ = UnhookWindowsHookEx(HHOOK(mh as *mut _));
+                }
+                if kh != 0 {
+                    let _ = UnhookWindowsHookEx(HHOOK(kh as *mut _));
+                }
+                install_hooks();
+                log::debug!("[hook] Health check: hooks re-installed");
+            }
+
             unsafe {
-                if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
-                    crate::window_layer::HOOK_HANDLE_GLOBAL.store(h.0 as isize, Ordering::SeqCst);
-                }
-                if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0)
-                {
-                    crate::window_layer::KB_HOOK_HANDLE_GLOBAL
-                        .store(h.0 as isize, Ordering::SeqCst);
-                }
+                install_hooks();
+                // Start periodic hook health timer
+                SetTimer(
+                    HWND::default(),
+                    HOOK_HEALTH_TIMER_ID,
+                    HOOK_HEALTH_INTERVAL_MS,
+                    None,
+                );
+
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                    if msg.message == WM_TIMER && msg.wParam.0 == HOOK_HEALTH_TIMER_ID {
+                        check_hook_health();
+                    } else {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
                 }
             }
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn make_lparam_positive() {
+            let lp = make_lparam(100, 200);
+            let x = (lp & 0xFFFF) as i16;
+            let y = ((lp >> 16) & 0xFFFF) as i16;
+            assert_eq!(x, 100);
+            assert_eq!(y, 200);
+        }
+
+        #[test]
+        fn make_lparam_negative() {
+            let lp = make_lparam(-50, -100);
+            let x = (lp & 0xFFFF) as i16;
+            let y = ((lp >> 16) & 0xFFFF) as i16;
+            assert_eq!(x, -50);
+            assert_eq!(y, -100);
+        }
+
+        #[test]
+        fn make_lparam_zero() {
+            assert_eq!(make_lparam(0, 0), 0);
+        }
+
+        #[test]
+        fn make_lparam_max_i16() {
+            let lp = make_lparam(i16::MAX as i32, i16::MIN as i32);
+            let x = (lp & 0xFFFF) as i16;
+            let y = ((lp >> 16) & 0xFFFF) as i16;
+            assert_eq!(x, i16::MAX);
+            assert_eq!(y, i16::MIN);
+        }
+
+        #[test]
+        fn make_lparam_multi_monitor() {
+            // Typical dual-monitor: second monitor at x=1920
+            let lp = make_lparam(2560, 720);
+            let x = (lp & 0xFFFF) as i16;
+            let y = ((lp >> 16) & 0xFFFF) as i16;
+            assert_eq!(x, 2560);
+            assert_eq!(y, 720);
+        }
     }
 }
