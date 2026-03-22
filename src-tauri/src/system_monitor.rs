@@ -407,16 +407,12 @@ fn collect_audio_info() -> Option<AudioInfo> {
                         .GetValue(&PKEY_Device_FriendlyName)
                         .ok()
                         .and_then(|val| {
-                            let pwsz = val.Anonymous.Anonymous.Anonymous.pwszVal;
-                            if pwsz.is_null() {
+                            // PROPVARIANT containing VT_LPWSTR — extract via Display trait
+                            let s = format!("{}", val);
+                            if s.is_empty() {
                                 None
                             } else {
-                                let s = pwsz.to_string().ok()?;
-                                if s.is_empty() {
-                                    None
-                                } else {
-                                    Some(s)
-                                }
+                                Some(s)
                             }
                         })
                 });
@@ -453,7 +449,7 @@ fn collect_with_system(sys: &mut sysinfo::System, mask: u32) -> SystemData {
 fn collect_with_peripherals(
     sys: &mut sysinfo::System,
     mask: u32,
-    peripherals: Option<&mut Peripherals>,
+    mut peripherals: Option<&mut Peripherals>,
 ) -> SystemData {
     let mut data = SystemData::default();
 
