@@ -201,14 +201,16 @@ fn start_with_tauri_webview() {
 
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 255)));
-                match window_layer::setup_desktop_window(&window) {
-                    Ok(()) => {
-                        let _ = window.show();
-                    }
-                    Err(e) => {
-                        error!("[setup] Failed to setup desktop window: {}", e);
-                    }
-                }
+                // DEBUG: skip WorkerW injection to test if Cloudflare challenge works in normal window
+                // match window_layer::setup_desktop_window(&window) {
+                //     Ok(()) => {
+                //         let _ = window.show();
+                //     }
+                //     Err(e) => {
+                //         error!("[setup] Failed to setup desktop window: {}", e);
+                //     }
+                // }
+                let _ = window.show();
             }
 
             system_monitor::start_monitor(handle.clone(), MONITOR_INTERVAL_SECS);
