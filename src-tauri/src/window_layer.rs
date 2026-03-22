@@ -1956,7 +1956,6 @@ pub mod mouse_hook {
                     let _ = UnhookWindowsHookEx(HHOOK(kh as *mut _));
                 }
                 install_hooks();
-                log::debug!("[hook] Health check: hooks re-installed");
             }
 
             unsafe {

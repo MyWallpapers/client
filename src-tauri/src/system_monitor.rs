@@ -619,12 +619,6 @@ pub fn start_monitor(app_handle: tauri::AppHandle, interval_secs: u64) {
 
             let data = collect_with_peripherals(&mut sys, mask, Some(&mut peripherals));
 
-            // Update shared System so one-shot IPC calls get fresh CPU baseline
-            if mask & MASK_CPU != 0 {
-                // No-op: one-shot calls use SHARED_SYS which is separate.
-                // The shared sys is populated on first one-shot call.
-            }
-
             let event = AppEvent::SystemDataUpdate(Box::new(data));
             if let Err(e) = app_handle.emit_app_event(&event) {
                 error!("[system_monitor] Failed to emit event: {}", e);

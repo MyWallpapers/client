@@ -12,9 +12,12 @@ mod tray;
 mod window_layer;
 
 use log::{error, info, warn};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+
+/// Shutdown flag for the heartbeat watchdog thread.
+static APP_RUNNING: AtomicBool = AtomicBool::new(true);
 
 // Timing constants for the WebView heartbeat watchdog
 const HEARTBEAT_GRACE_SECS: u64 = 30;
@@ -190,7 +193,7 @@ fn start_with_tauri_webview() {
                 use tauri::Manager;
                 // Grace period for initial page load
                 std::thread::sleep(Duration::from_secs(HEARTBEAT_GRACE_SECS));
-                loop {
+                while APP_RUNNING.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_secs(HEARTBEAT_POLL_SECS));
                     let elapsed = monotonic_secs() - hb_ref.load(Ordering::Relaxed);
                     if elapsed > HEARTBEAT_TIMEOUT_SECS {
@@ -226,6 +229,7 @@ fn start_with_tauri_webview() {
 
     app.run(|_app_handle, event| {
         if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+            APP_RUNNING.store(false, Ordering::Relaxed);
             system_monitor::stop_monitor();
             discord::shutdown();
             window_layer::restore_desktop_icons_and_unhook();
