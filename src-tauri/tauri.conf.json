@@ -51,7 +51,7 @@
         "closable": true,
         "focus": true,
         "visible": true,
-        "devtools": false,
+        "devtools": true,
         "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
       }
     ]
