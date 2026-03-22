@@ -659,7 +659,7 @@ fn ensure_in_worker_w(window: &tauri::WebviewWindow) -> crate::error::AppResult<
 
 #[cfg(target_os = "windows")]
 pub mod mouse_hook {
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
