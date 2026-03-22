@@ -312,6 +312,22 @@ pub fn media_prev() -> AppResult<()> {
 }
 
 #[tauri::command]
+pub fn open_path(app: tauri::AppHandle, path: String) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let parsed =
+        url::Url::parse(&path).map_err(|_| AppError::Validation("Invalid URL".into()))?;
+    match parsed.scheme() {
+        "https" | "http" => app
+            .opener()
+            .open_url(&path, None::<&str>)
+            .map_err(|e| AppError::Io(std::io::Error::other(format!("Failed to open: {}", e)))),
+        _ => Err(AppError::Validation(
+            "Only http/https URLs are allowed".into(),
+        )),
+    }
+}
+
+#[tauri::command]
 pub fn update_discord_presence(details: String, state: String) -> AppResult<()> {
     crate::discord::update_presence(&details, &state)
 }

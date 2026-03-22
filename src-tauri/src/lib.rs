@@ -221,6 +221,7 @@ fn start_with_tauri_webview() {
             commands::media_play_pause,
             commands::media_next,
             commands::media_prev,
+            commands::open_path,
             commands::update_discord_presence,
             window_layer::set_desktop_icons_visible,
         ])

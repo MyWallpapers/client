@@ -39,12 +39,15 @@ The CI automatically:
 ```
 src-tauri/src/
 ├── main.rs            # Entry point (windows_subsystem)
-├── lib.rs             # App init, plugins, window setup, invoke_handler
-├── commands.rs        # Tauri IPC command wrappers
-├── commands_core.rs   # Platform-independent business logic + types
-├── system_monitor.rs  # System data collection (CPU, memory, battery, disk, network)
+├── lib.rs             # App init, plugins, window setup, heartbeat watchdog, invoke_handler
+├── commands.rs        # Tauri IPC command wrappers + types + validation
+├── system_monitor.rs  # System data collection (CPU, memory, battery, disk, network, GPU, display, audio)
+├── media.rs           # Media playback info + control via WinRT SMTC
+├── discord.rs         # Discord Rich Presence with periodic retry
 ├── tray.rs            # System tray (quit only)
-└── window_layer.rs    # Desktop injection + mouse engine + visibility watchdog
+├── events.rs          # Event types + EmitAppEvent trait
+├── error.rs           # AppError enum + Serialize impl
+└── window_layer.rs    # Desktop injection + mouse/keyboard hooks + icon drag engine
 ```
 
 ### Window Layer System (`window_layer.rs`)
@@ -52,14 +55,14 @@ src-tauri/src/
 The core of the app. Three subsystems:
 
 1. **WorkerW Injection** — Detects OS architecture (Win11 24H2+ vs Legacy), injects WebView as child of WorkerW/Progman with correct Z-order
-2. **Mouse Hook** — Low-level `WH_MOUSE_LL` hook with MSAA-based icon detection (`ROLE_SYSTEM_LISTITEM = 34`). State machine: IDLE/NATIVE/WEB. Forwards web clicks to `Chrome_RenderWidgetHostHWND`
-3. **Visibility Watchdog** — Polls foreground window every 2s, emits `wallpaper-visibility` event when fullscreen app covers wallpaper (multi-monitor aware)
+2. **Mouse/Keyboard Hooks** — Low-level `WH_MOUSE_LL` + `WH_KEYBOARD_LL` hooks. Cross-process `LVM_HITTEST` for icon detection, native drag via `LVM_SETITEMPOSITION` with ImageList ghost overlay. Two modes: wallpaper (passthrough to SysListView32 + composition controller) and interface (PostMessage to Chrome_RWHH with WM_CHAR generation). Includes hook health timer (10s re-install), session lock/unlock detection, display change resize
+3. **Zombie Watchdog** — Polls parent HWND every 5s, re-detects desktop + re-injects if parent becomes stale (explorer restart)
 
 ### System Monitor (`system_monitor.rs`)
 
 Exposes system data to widgets via Tauri IPC:
 
-- **Categories**: `cpu`, `memory`, `battery`, `disk`, `network`
+- **Categories**: `cpu`, `memory`, `battery`, `disk`, `network`, `media`, `gpu`, `display`, `audio`, `uptime`
 - **One-shot**: `get_system_data(categories)` returns filtered `SystemData`
 - **Real-time**: Background thread polls every 3s, emits `system-data-update` event
 - **Permission-gated**: Frontend filters data per widget based on manifest capabilities
@@ -76,6 +79,12 @@ Exposes system data to widgets via Tauri IPC:
 | `restart_app` | Restart to apply update |
 | `open_oauth_in_browser` | Open OAuth URL in default browser |
 | `reload_window` | Emit reload event to frontend |
+| `get_media_info` | Current media playback info (WinRT SMTC) |
+| `media_play_pause` | Toggle play/pause on active media session |
+| `media_next` | Skip to next track |
+| `media_prev` | Skip to previous track |
+| `open_path` | Open http/https URL in default browser (addon use) |
+| `update_discord_presence` | Update Discord Rich Presence activity |
 | `set_desktop_icons_visible` | Show/hide native desktop icons (Windows: ShowWindow) |
 
 ### Safety

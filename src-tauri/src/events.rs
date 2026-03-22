@@ -29,6 +29,23 @@ pub trait EmitAppEvent {
 impl EmitAppEvent for tauri::AppHandle {
     fn emit_app_event(&self, event: &AppEvent) -> Result<(), tauri::Error> {
         use tauri::Emitter;
-        self.emit(event.event_name(), event)
+        // Emit raw inner data — frontend expects plain values, not the tagged enum wrapper.
+        match event {
+            AppEvent::WallpaperVisibility { visible } => {
+                self.emit(event.event_name(), visible)
+            }
+            AppEvent::UpdateProgress { status } => {
+                self.emit(event.event_name(), status)
+            }
+            AppEvent::SystemDataUpdate(data) => {
+                self.emit(event.event_name(), data.as_ref())
+            }
+            AppEvent::DeepLink { url } => {
+                self.emit(event.event_name(), url)
+            }
+            AppEvent::ReloadApp => {
+                self.emit(event.event_name(), ())
+            }
+        }
     }
 }
