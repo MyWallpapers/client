@@ -34,24 +34,24 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "csp": null
+      "csp": "default-src 'self' https://dev.mywallpaper.online https://app.mywallpaper.online https://api.mywallpaper.online; img-src 'self' data: blob: https: http://localhost:*; media-src 'self' data: blob: https: http://localhost:*; script-src 'self' 'unsafe-inline' https://dev.mywallpaper.online https://app.mywallpaper.online https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://dev.mywallpaper.online https://app.mywallpaper.online; connect-src 'self' ipc: http://ipc.localhost https://dev.mywallpaper.online https://app.mywallpaper.online https://api.mywallpaper.online https://api.github.com https://cdn.mywallpaper.online wss://dev.mywallpaper.online wss://app.mywallpaper.online; font-src 'self' blob: https://cdn.mywallpaper.online; frame-src 'self' https://*.mywallpaper.online;"
     },
     "windows": [
       {
         "label": "main",
         "title": "MyWallpaper",
         "fullscreen": false,
-        "decorations": true,
+        "decorations": false,
         "transparent": false,
         "alwaysOnTop": false,
-        "skipTaskbar": false,
-        "resizable": true,
-        "maximizable": true,
-        "minimizable": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
         "closable": true,
-        "focus": true,
-        "visible": true,
-        "devtools": true,
+        "focus": false,
+        "visible": false,
+        "devtools": false,
         "additionalBrowserArgs": "--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist"
       }
     ]

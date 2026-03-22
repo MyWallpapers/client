@@ -113,23 +113,8 @@ fn start_with_tauri_webview() {
             match payload.event() {
                 PageLoadEvent::Started => {
                     let _ = webview.eval(&*MW_INIT_SCRIPT);
-                    // Debug: capture errors from the very start
-                    let _ = webview.eval(r#"
-                        window.__MW_ERRORS = [];
-                        window.onerror = function(m,u,l){ window.__MW_ERRORS.push('ERR:'+m+' @'+u+':'+l); };
-                        window.addEventListener('unhandledrejection', function(e){
-                            window.__MW_ERRORS.push('REJECT:'+(e.reason&&e.reason.message||e.reason||'?'));
-                        });
-                        setInterval(function(){
-                            if(window.__MW_ERRORS.length > 0) {
-                                try{localStorage.setItem('__mw_diag', JSON.stringify(window.__MW_ERRORS))}catch(e){}
-                            }
-                        }, 3000);
-                    "#);
                 }
                 PageLoadEvent::Finished => {
-                    #[cfg(debug_assertions)]
-                    webview.open_devtools();
                     // Heartbeat: frontend pings every 5s so backend can detect unresponsive WebView
                     let _ = webview.eval(
                         r#"
@@ -178,16 +163,14 @@ fn start_with_tauri_webview() {
 
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 255)));
-                // DEBUG: skip WorkerW injection to test if Cloudflare challenge works in normal window
-                // match window_layer::setup_desktop_window(&window) {
-                //     Ok(()) => {
-                //         let _ = window.show();
-                //     }
-                //     Err(e) => {
-                //         error!("[setup] Failed to setup desktop window: {}", e);
-                //     }
-                // }
-                let _ = window.show();
+                match window_layer::setup_desktop_window(&window) {
+                    Ok(()) => {
+                        let _ = window.show();
+                    }
+                    Err(e) => {
+                        error!("[setup] Failed to setup desktop window: {}", e);
+                    }
+                }
             }
 
             system_monitor::start_monitor(handle.clone(), MONITOR_INTERVAL_SECS);
