@@ -8,6 +8,34 @@ use serde::Serialize;
 use std::sync::LazyLock;
 use typeshare::typeshare;
 
+// ============================================================================
+// Virtual Desktop Types
+// ============================================================================
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorLayout {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale_factor: f32,
+    pub is_primary: bool,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualDesktopInfo {
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub monitors: Vec<MonitorLayout>,
+}
+
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Cached system info — OS details never change during app lifetime.
@@ -314,8 +342,7 @@ pub fn media_prev() -> AppResult<()> {
 #[tauri::command]
 pub fn open_path(app: tauri::AppHandle, path: String) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let parsed =
-        url::Url::parse(&path).map_err(|_| AppError::Validation("Invalid URL".into()))?;
+    let parsed = url::Url::parse(&path).map_err(|_| AppError::Validation("Invalid URL".into()))?;
     match parsed.scheme() {
         "https" | "http" => app
             .opener()
@@ -330,6 +357,69 @@ pub fn open_path(app: tauri::AppHandle, path: String) -> AppResult<()> {
 #[tauri::command]
 pub fn update_discord_presence(details: String, state: String) -> AppResult<()> {
     crate::discord::update_presence(&details, &state)
+}
+
+#[tauri::command]
+pub fn enter_virtual_desktop_mode() -> AppResult<VirtualDesktopInfo> {
+    // Collect display info to build monitor layout
+    let displays = system_monitor::collect_system_data(system_monitor::MASK_DISPLAY);
+    let monitors: Vec<MonitorLayout> = displays
+        .display
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| MonitorLayout {
+            name: d.name,
+            x: d.x,
+            y: d.y,
+            width: d.width,
+            height: d.height,
+            scale_factor: d.scale_factor.unwrap_or(1.0),
+            is_primary: d.primary,
+        })
+        .collect();
+
+    if monitors.is_empty() {
+        return Err(AppError::Validation("No monitors detected".into()));
+    }
+
+    let origin_x = monitors.iter().map(|m| m.x).min().unwrap_or(0);
+    let origin_y = monitors.iter().map(|m| m.y).min().unwrap_or(0);
+    let max_x = monitors
+        .iter()
+        .map(|m| m.x + m.width as i32)
+        .max()
+        .unwrap_or(1920);
+    let max_y = monitors
+        .iter()
+        .map(|m| m.y + m.height as i32)
+        .max()
+        .unwrap_or(1080);
+
+    info!(
+        "[virtual_desktop] Enter: origin=({},{}), size={}x{}, {} monitors",
+        origin_x,
+        origin_y,
+        max_x - origin_x,
+        max_y - origin_y,
+        monitors.len()
+    );
+
+    // Window is already spanning the virtual desktop (setup_desktop_window handles this)
+    // so we just return the layout info for the frontend to use
+    Ok(VirtualDesktopInfo {
+        origin_x,
+        origin_y,
+        width: (max_x - origin_x) as u32,
+        height: (max_y - origin_y) as u32,
+        monitors,
+    })
+}
+
+#[tauri::command]
+pub fn exit_virtual_desktop_mode() {
+    info!("[virtual_desktop] Exit (no-op: window stays on virtual desktop)");
+    // The window remains spanning all monitors — it's the wallpaper.
+    // The frontend handles showing/hiding UI layers.
 }
 
 // ============================================================================

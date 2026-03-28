@@ -223,6 +223,8 @@ fn start_with_tauri_webview() {
             commands::media_prev,
             commands::open_path,
             commands::update_discord_presence,
+            commands::enter_virtual_desktop_mode,
+            commands::exit_virtual_desktop_mode,
             window_layer::set_desktop_icons_visible,
         ])
         .build(tauri::generate_context!())

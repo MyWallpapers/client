@@ -121,6 +121,10 @@ pub struct GpuInfo {
 pub struct DisplayInfo {
     /// Display name/model
     pub name: String,
+    /// X position in virtual desktop coordinates
+    pub x: i32,
+    /// Y position in virtual desktop coordinates
+    pub y: i32,
     /// Width in pixels
     pub width: u32,
     /// Height in pixels
@@ -341,6 +345,8 @@ fn collect_display_info() -> Option<Vec<DisplayInfo>> {
 
         acc.0.push(DisplayInfo {
             name,
+            x: info.monitor_rect.left,
+            y: info.monitor_rect.top,
             width,
             height,
             refresh_rate,
